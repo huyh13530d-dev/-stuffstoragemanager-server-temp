@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional
-from sqlalchemy import desc
+from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
 try:
     from database import SessionLocal, Product, Variant, Area, Order, OrderItem, Customer, DebtLog, engine, is_sqlite, Base
@@ -142,7 +142,7 @@ def ensure_area_schema_and_seed():
 
                 default_area_id = conn.execute(text("SELECT id FROM areas WHERE name = 'Chợ hàn' LIMIT 1")).scalar()
                 if default_area_id is not None:
-                    conn.execute(text("UPDATE customers SET area_id = :aid"), {"aid": int(default_area_id)})
+                    conn.execute(text("UPDATE customers SET area_id = :aid WHERE area_id IS NULL"), {"aid": int(default_area_id)})
                 conn.commit()
             else:
                 conn.execute(text("CREATE TABLE IF NOT EXISTS areas (id SERIAL PRIMARY KEY, name VARCHAR UNIQUE)"))
@@ -153,7 +153,7 @@ def ensure_area_schema_and_seed():
 
                 default_area_id = conn.execute(text("SELECT id FROM areas WHERE name = 'Chợ hàn' LIMIT 1")).scalar()
                 if default_area_id is not None:
-                    conn.execute(text("UPDATE customers SET area_id = :aid"), {"aid": int(default_area_id)})
+                    conn.execute(text("UPDATE customers SET area_id = :aid WHERE area_id IS NULL"), {"aid": int(default_area_id)})
                 conn.commit()
     except Exception as e:
         print("Warning: ensure_area_schema_and_seed failed:", e)
@@ -164,7 +164,10 @@ ensure_area_schema_and_seed()
 
 def _get_default_area_id(db: Session):
     area = db.query(Area).filter(Area.name == "Chợ hàn").first()
-    return area.id if area else None
+    if area:
+        return area.id
+    first_area = db.query(Area).order_by(Area.id).first()
+    return first_area.id if first_area else None
 
 # --- DEPENDENCY: KẾT NỐI DB ---
 def get_db():
@@ -179,6 +182,13 @@ class CustomerCreate(BaseModel):
     name: str
     phone: str = ""
     debt: int = 0
+    area_id: int
+
+class AreaCreate(BaseModel):
+    name: str
+
+class AreaUpdate(BaseModel):
+    name: str
 
 class VariantUpdate(BaseModel):
     id: Optional[int] = None
@@ -222,7 +232,8 @@ class PickerConfirmRequest(BaseModel):
 class CustomerUpdate(BaseModel):
     name: str
     phone: str
-    debt: int 
+    debt: int
+    area_id: int
 
 # --- API SẢN PHẨM ---
 @app.get("/products")
@@ -306,15 +317,79 @@ def delete_product(product_id: int, db: Session = Depends(get_db)):
         db.commit()
     return {"status": "deleted"}
 
+@app.get("/areas")
+def get_areas(db: Session = Depends(get_db)):
+    areas = db.query(Area).order_by(Area.id).all()
+    result = []
+    for a in areas:
+        custs = db.query(Customer).filter(Customer.area_id == a.id).all()
+        result.append({
+            "id": a.id,
+            "name": a.name,
+            "customer_count": len(custs),
+            "total_debt": sum(int(c.debt or 0) for c in custs),
+        })
+    return result
+
+@app.post("/areas")
+def create_area(data: AreaCreate, db: Session = Depends(get_db)):
+    name = data.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Tên khu vực không hợp lệ")
+    existed = db.query(Area).filter(func.lower(Area.name) == func.lower(name)).first()
+    if existed:
+        raise HTTPException(status_code=400, detail="Khu vực đã tồn tại")
+    area = Area(name=name)
+    db.add(area)
+    db.commit()
+    db.refresh(area)
+    return {"status": "created", "id": area.id}
+
+@app.put("/areas/{area_id}")
+def update_area(area_id: int, data: AreaUpdate, db: Session = Depends(get_db)):
+    area = db.query(Area).filter(Area.id == area_id).first()
+    if not area:
+        raise HTTPException(status_code=404, detail="Khu vực không tồn tại")
+    name = data.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Tên khu vực không hợp lệ")
+    dup = db.query(Area).filter(func.lower(Area.name) == func.lower(name), Area.id != area_id).first()
+    if dup:
+        raise HTTPException(status_code=400, detail="Tên khu vực đã tồn tại")
+    area.name = name
+    db.commit()
+    return {"status": "updated"}
+
+@app.delete("/areas/{area_id}")
+def delete_area(area_id: int, db: Session = Depends(get_db)):
+    area = db.query(Area).filter(Area.id == area_id).first()
+    if not area:
+        raise HTTPException(status_code=404, detail="Khu vực không tồn tại")
+
+    target_id = _get_default_area_id(db)
+    if target_id == area_id:
+        fallback = db.query(Area).filter(Area.id != area_id).order_by(Area.id).first()
+        target_id = fallback.id if fallback else None
+    if target_id is None:
+        raise HTTPException(status_code=400, detail="Không thể xóa khu vực duy nhất")
+
+    db.query(Customer).filter(Customer.area_id == area_id).update({Customer.area_id: target_id})
+    db.delete(area)
+    db.commit()
+    return {"status": "deleted", "moved_to_area_id": target_id}
+
 # --- API KHÁCH HÀNG ---
 @app.post("/customers")
 def create_customer_manual(data: CustomerCreate, db: Session = Depends(get_db)):
     try:
         if db.query(Customer).filter(Customer.name == data.name).first():
             raise HTTPException(status_code=400, detail="Tên đã tồn tại!")
-        
-        default_area_id = _get_default_area_id(db)
-        new_cust = Customer(name=data.name, phone=data.phone, debt=data.debt, area_id=default_area_id)
+
+        area = db.query(Area).filter(Area.id == data.area_id).first()
+        if not area:
+            raise HTTPException(status_code=400, detail="Khu vực không tồn tại")
+
+        new_cust = Customer(name=data.name, phone=data.phone, debt=data.debt, area_id=data.area_id)
         db.add(new_cust)
         db.flush()
         
@@ -333,18 +408,30 @@ def create_customer_manual(data: CustomerCreate, db: Session = Depends(get_db)):
 @app.get("/customers")
 def get_customers(db: Session = Depends(get_db)):
     custs = db.query(Customer).order_by(desc(Customer.id)).all()
-    return [{"id": c.id, "name": c.name, "phone": c.phone, "debt": c.debt, "area_id": c.area_id} for c in custs]
+    return [{
+        "id": c.id,
+        "name": c.name,
+        "phone": c.phone,
+        "debt": c.debt,
+        "area_id": c.area_id,
+        "area_name": (c.area_rel.name if c.area_rel else ""),
+    } for c in custs]
 
 @app.put("/customers/{cid}")
 def update_customer_excel(cid: int, data: CustomerUpdate, db: Session = Depends(get_db)):
     cust = db.query(Customer).filter(Customer.id == cid).first()
     if not cust:
         raise HTTPException(status_code=404)
+
+    area = db.query(Area).filter(Area.id == data.area_id).first()
+    if not area:
+        raise HTTPException(status_code=400, detail="Khu vực không tồn tại")
     
     diff = data.debt - cust.debt
     cust.name = data.name
     cust.phone = data.phone
     cust.debt = data.debt
+    cust.area_id = data.area_id
     
     if diff != 0:
         db.add(DebtLog(customer_id=cust.id, change_amount=diff, new_balance=cust.debt, note="Điều chỉnh thủ công", created_ts=int(datetime.utcnow().timestamp() * 1000)))
@@ -565,11 +652,10 @@ def checkout(data: CheckoutRequest, db: Session = Depends(get_db)):
         customer = None
         
         if c_name:
-            from sqlalchemy import func
             customer = db.query(Customer).filter(func.lower(Customer.name) == func.lower(c_name)).first()
             
             if not customer:
-                customer = Customer(name=c_name, phone=data.customer_phone, debt=0)
+                customer = Customer(name=c_name, phone=data.customer_phone, debt=0, area_id=_get_default_area_id(db))
                 db.add(customer)
                 db.flush()
             
@@ -638,9 +724,9 @@ def update_order_api(order_id: int, data: CheckoutRequest, db: Session = Depends
         c_name = data.customer_name.strip()
         customer = None
         if c_name:
-            customer = db.query(Customer).filter(Customer.name == c_name).first()
+            customer = db.query(Customer).filter(func.lower(Customer.name) == func.lower(c_name)).first()
             if not customer:
-                customer = Customer(name=c_name, phone=data.customer_phone, debt=0)
+                customer = Customer(name=c_name, phone=data.customer_phone, debt=0, area_id=_get_default_area_id(db))
                 db.add(customer)
                 db.flush()
             customer.debt += total_new
@@ -746,11 +832,10 @@ def checkout_draft(data: CheckoutRequest, db: Session = Depends(get_db)):
         customer = None
 
         if c_name:
-            from sqlalchemy import func
             customer = db.query(Customer).filter(func.lower(Customer.name) == func.lower(c_name)).first()
 
             if not customer:
-                customer = Customer(name=c_name, phone=data.customer_phone, debt=0)
+                customer = Customer(name=c_name, phone=data.customer_phone, debt=0, area_id=_get_default_area_id(db))
                 db.add(customer)
                 db.flush()
 
