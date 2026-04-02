@@ -48,6 +48,12 @@ class Variant(Base):
     stock = Column(Integer)
     product = relationship("Product", back_populates="variants")
 
+class Area(Base):
+    __tablename__ = "areas"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True)
+    customers = relationship("Customer", back_populates="area_rel")
+
 # 2. Customer & Debt (MỚI)
 class Customer(Base):
     __tablename__ = "customers"
@@ -55,7 +61,9 @@ class Customer(Base):
     name = Column(String, index=True, unique=True) # Tên là định danh duy nhất để gợi ý
     phone = Column(String, default="")
     debt = Column(Integer, default=0) # Tổng nợ hiện tại
+    area_id = Column(Integer, ForeignKey("areas.id"), nullable=True)
     
+    area_rel = relationship("Area", back_populates="customers")
     logs = relationship("DebtLog", back_populates="customer", cascade="all, delete-orphan")
     orders = relationship("Order", back_populates="customer_rel")
 

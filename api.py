@@ -4,9 +4,9 @@ from typing import List, Optional
 from sqlalchemy import desc
 from sqlalchemy.orm import Session
 try:
-    from database import SessionLocal, Product, Variant, Order, OrderItem, Customer, DebtLog, engine, is_sqlite, Base
+    from database import SessionLocal, Product, Variant, Area, Order, OrderItem, Customer, DebtLog, engine, is_sqlite, Base
 except ImportError:
-    from backend.database import SessionLocal, Product, Variant, Order, OrderItem, Customer, DebtLog, engine, is_sqlite, Base
+    from backend.database import SessionLocal, Product, Variant, Area, Order, OrderItem, Customer, DebtLog, engine, is_sqlite, Base
 from sqlalchemy import text
 from datetime import datetime
 
@@ -125,8 +125,46 @@ def ensure_picker_note_column():
     except Exception as e:
         print("Warning: ensure_picker_note_column failed:", e)
 
+def ensure_area_schema_and_seed():
+    seed_areas = ["Chợ đêm", "Chợ hàn", "Hội An", "Nha Trang"]
+    try:
+        with engine.connect() as conn:
+            if is_sqlite:
+                conn.execute(text("CREATE TABLE IF NOT EXISTS areas (id INTEGER PRIMARY KEY, name VARCHAR UNIQUE)"))
+
+                info = conn.execute(text("PRAGMA table_info('customers')")).fetchall()
+                cols = [r[1] for r in info]
+                if 'area_id' not in cols:
+                    conn.execute(text("ALTER TABLE customers ADD COLUMN area_id INTEGER"))
+
+                for n in seed_areas:
+                    conn.execute(text("INSERT OR IGNORE INTO areas (name) VALUES (:n)"), {"n": n})
+
+                default_area_id = conn.execute(text("SELECT id FROM areas WHERE name = 'Chợ hàn' LIMIT 1")).scalar()
+                if default_area_id is not None:
+                    conn.execute(text("UPDATE customers SET area_id = :aid"), {"aid": int(default_area_id)})
+                conn.commit()
+            else:
+                conn.execute(text("CREATE TABLE IF NOT EXISTS areas (id SERIAL PRIMARY KEY, name VARCHAR UNIQUE)"))
+                conn.execute(text("ALTER TABLE customers ADD COLUMN IF NOT EXISTS area_id INTEGER"))
+
+                for n in seed_areas:
+                    conn.execute(text("INSERT INTO areas (name) VALUES (:n) ON CONFLICT (name) DO NOTHING"), {"n": n})
+
+                default_area_id = conn.execute(text("SELECT id FROM areas WHERE name = 'Chợ hàn' LIMIT 1")).scalar()
+                if default_area_id is not None:
+                    conn.execute(text("UPDATE customers SET area_id = :aid"), {"aid": int(default_area_id)})
+                conn.commit()
+    except Exception as e:
+        print("Warning: ensure_area_schema_and_seed failed:", e)
+
 ensure_status_column()
 ensure_picker_note_column()
+ensure_area_schema_and_seed()
+
+def _get_default_area_id(db: Session):
+    area = db.query(Area).filter(Area.name == "Chợ hàn").first()
+    return area.id if area else None
 
 # --- DEPENDENCY: KẾT NỐI DB ---
 def get_db():
@@ -275,7 +313,8 @@ def create_customer_manual(data: CustomerCreate, db: Session = Depends(get_db)):
         if db.query(Customer).filter(Customer.name == data.name).first():
             raise HTTPException(status_code=400, detail="Tên đã tồn tại!")
         
-        new_cust = Customer(name=data.name, phone=data.phone, debt=data.debt)
+        default_area_id = _get_default_area_id(db)
+        new_cust = Customer(name=data.name, phone=data.phone, debt=data.debt, area_id=default_area_id)
         db.add(new_cust)
         db.flush()
         
@@ -294,7 +333,7 @@ def create_customer_manual(data: CustomerCreate, db: Session = Depends(get_db)):
 @app.get("/customers")
 def get_customers(db: Session = Depends(get_db)):
     custs = db.query(Customer).order_by(desc(Customer.id)).all()
-    return [{"id": c.id, "name": c.name, "phone": c.phone, "debt": c.debt} for c in custs]
+    return [{"id": c.id, "name": c.name, "phone": c.phone, "debt": c.debt, "area_id": c.area_id} for c in custs]
 
 @app.put("/customers/{cid}")
 def update_customer_excel(cid: int, data: CustomerUpdate, db: Session = Depends(get_db)):
