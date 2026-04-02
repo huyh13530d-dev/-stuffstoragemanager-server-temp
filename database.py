@@ -95,9 +95,16 @@ class Order(Base):
     # status: 'pending' | 'accepted' | 'completed'
     status = Column(String, default='completed')
     picker_note = Column(String, default="")
+    assigned_picker_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
+    assigned_at = Column(DateTime, nullable=True)
+    delivered_by_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
+    delivered_at = Column(DateTime, nullable=True)
+    delivery_photo_path = Column(String, default="")
 
     items = relationship("OrderItem", back_populates="order")
     customer_rel = relationship("Customer", back_populates="orders")
+    assigned_picker = relationship("Employee", foreign_keys=[assigned_picker_id], back_populates="assigned_orders")
+    delivered_by = relationship("Employee", foreign_keys=[delivered_by_id], back_populates="delivered_orders")
 
 class OrderItem(Base):
     __tablename__ = "order_items"

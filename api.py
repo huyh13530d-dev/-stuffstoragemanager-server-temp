@@ -4,9 +4,9 @@ from typing import List, Optional
 from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
 try:
-    from database import SessionLocal, Product, Variant, Area, Order, OrderItem, Customer, DebtLog, engine, is_sqlite, Base
+    from database import SessionLocal, Product, Variant, Area, Order, OrderItem, Customer, DebtLog, Employee, engine, is_sqlite, Base
 except ImportError:
-    from backend.database import SessionLocal, Product, Variant, Area, Order, OrderItem, Customer, DebtLog, engine, is_sqlite, Base
+    from backend.database import SessionLocal, Product, Variant, Area, Order, OrderItem, Customer, DebtLog, Employee, engine, is_sqlite, Base
 from sqlalchemy import text
 from datetime import datetime
 
@@ -158,9 +158,74 @@ def ensure_area_schema_and_seed():
     except Exception as e:
         print("Warning: ensure_area_schema_and_seed failed:", e)
 
+def ensure_employee_schema_and_seed():
+    try:
+        with engine.connect() as conn:
+            if is_sqlite:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS employees (
+                        id INTEGER PRIMARY KEY,
+                        name VARCHAR,
+                        phone VARCHAR,
+                        role VARCHAR,
+                        pin VARCHAR UNIQUE,
+                        created_at DATETIME
+                    )
+                """))
+                conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_employees_pin ON employees(pin)"))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_employees_role ON employees(role)"))
+                conn.execute(text("INSERT OR IGNORE INTO employees (name, phone, role, pin, created_at) VALUES ('Orderer mặc định', '', 'orderer', '0000', CURRENT_TIMESTAMP)"))
+                conn.execute(text("INSERT OR IGNORE INTO employees (name, phone, role, pin, created_at) VALUES ('Picker mặc định', '', 'picker', '1111', CURRENT_TIMESTAMP)"))
+                conn.commit()
+            else:
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS employees (
+                        id SERIAL PRIMARY KEY,
+                        name VARCHAR,
+                        phone VARCHAR,
+                        role VARCHAR,
+                        pin VARCHAR UNIQUE,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """))
+                conn.execute(text("CREATE INDEX IF NOT EXISTS ix_employees_role ON employees(role)"))
+                conn.execute(text("INSERT INTO employees (name, phone, role, pin) VALUES ('Orderer mặc định', '', 'orderer', '0000') ON CONFLICT (pin) DO NOTHING"))
+                conn.execute(text("INSERT INTO employees (name, phone, role, pin) VALUES ('Picker mặc định', '', 'picker', '1111') ON CONFLICT (pin) DO NOTHING"))
+                conn.commit()
+    except Exception as e:
+        print("Warning: ensure_employee_schema_and_seed failed:", e)
+
+def ensure_order_flow_columns():
+    cols = {
+        'assigned_picker_id': 'INTEGER',
+        'assigned_at': 'TIMESTAMP',
+        'delivered_by_id': 'INTEGER',
+        'delivered_at': 'TIMESTAMP',
+        'delivery_photo_path': 'VARCHAR',
+    }
+    try:
+        with engine.connect() as conn:
+            if is_sqlite:
+                info = conn.execute(text("PRAGMA table_info('orders')")).fetchall()
+                existing = [r[1] for r in info]
+                for c, t in cols.items():
+                    if c not in existing:
+                        conn.execute(text(f"ALTER TABLE orders ADD COLUMN {c} {t}"))
+                conn.execute(text("UPDATE orders SET status = 'approved' WHERE status = 'accepted'"))
+                conn.commit()
+            else:
+                for c, t in cols.items():
+                    conn.execute(text(f"ALTER TABLE orders ADD COLUMN IF NOT EXISTS {c} {t}"))
+                conn.execute(text("UPDATE orders SET status = 'approved' WHERE status = 'accepted'"))
+                conn.commit()
+    except Exception as e:
+        print("Warning: ensure_order_flow_columns failed:", e)
+
 ensure_status_column()
 ensure_picker_note_column()
 ensure_area_schema_and_seed()
+ensure_employee_schema_and_seed()
+ensure_order_flow_columns()
 
 def _get_default_area_id(db: Session):
     area = db.query(Area).filter(Area.name == "Chợ hàn").first()
@@ -168,6 +233,51 @@ def _get_default_area_id(db: Session):
         return area.id
     first_area = db.query(Area).order_by(Area.id).first()
     return first_area.id if first_area else None
+
+def _generate_unique_pin(db: Session):
+    import random
+    for _ in range(50):
+        pin = f"{random.randint(0, 9999):04d}"
+        existed = db.query(Employee).filter(Employee.pin == pin).first()
+        if not existed:
+            return pin
+    raise HTTPException(status_code=500, detail="Không tạo được PIN duy nhất")
+
+def _serialize_order(o: Order):
+    items_list = []
+    calc_qty = 0
+    if o.items:
+        for i in o.items:
+            q = int(i.quantity or 0)
+            calc_qty += q
+            items_list.append({
+                "order_item_id": i.id,
+                "product_name": i.product_name,
+                "variant_id": i.variant_id,
+                "variant_info": i.variant_info,
+                "quantity": q,
+                "price": int(i.price or 0),
+                "current_stock": None,
+                "enough_stock": True,
+            })
+    return {
+        "id": o.id,
+        "created_at": o.created_at.strftime("%Y-%m-%d %H:%M") if o.created_at else "",
+        "customer_name": o.customer_name or "Khách lẻ",
+        "customer_id": o.customer_id,
+        "total_amount": int(o.total_amount or 0),
+        "total_qty": calc_qty,
+        "status": o.status,
+        "picker_note": (o.picker_note or ""),
+        "assigned_picker_id": o.assigned_picker_id,
+        "assigned_picker_name": (o.assigned_picker.name if o.assigned_picker else ""),
+        "assigned_at": o.assigned_at.strftime("%Y-%m-%d %H:%M") if o.assigned_at else "",
+        "delivered_by_id": o.delivered_by_id,
+        "delivered_by_name": (o.delivered_by.name if o.delivered_by else ""),
+        "delivered_at": o.delivered_at.strftime("%Y-%m-%d %H:%M") if o.delivered_at else "",
+        "delivery_photo_path": (o.delivery_photo_path or ""),
+        "items": items_list,
+    }
 
 # --- DEPENDENCY: KẾT NỐI DB ---
 def get_db():
@@ -236,6 +346,92 @@ class CustomerUpdate(BaseModel):
     phone: str
     debt: int
     area_id: int
+
+class EmployeeCreate(BaseModel):
+    name: str
+    phone: str = ""
+    role: str
+
+class EmployeeUpdate(BaseModel):
+    name: str
+    phone: str = ""
+    role: str
+
+class PinLoginRequest(BaseModel):
+    pin: str
+    requested_role: str
+
+class ReceiveOrderRequest(BaseModel):
+    picker_id: int
+
+class DeliverOrderRequest(BaseModel):
+    picker_id: int
+    photo_path: str
+    items: List[PickerConfirmItem] = []
+
+# --- API NHÂN VIÊN / PHÂN QUYỀN ---
+@app.post('/auth/pin-login')
+def pin_login(data: PinLoginRequest, db: Session = Depends(get_db)):
+    req_role = data.requested_role.strip().lower()
+    if req_role not in ('orderer', 'picker', 'manager'):
+        raise HTTPException(status_code=400, detail='Vai trò không hợp lệ')
+    emp = db.query(Employee).filter(Employee.pin == data.pin.strip()).first()
+    if not emp:
+        raise HTTPException(status_code=401, detail='PIN không đúng')
+    if emp.role != req_role:
+        raise HTTPException(status_code=403, detail='PIN không thuộc vai trò này')
+    return {
+        'id': emp.id,
+        'name': emp.name,
+        'phone': emp.phone,
+        'role': emp.role,
+    }
+
+@app.get('/employees')
+def get_employees(db: Session = Depends(get_db)):
+    emps = db.query(Employee).order_by(desc(Employee.id)).all()
+    return [{
+        'id': e.id,
+        'name': e.name,
+        'phone': e.phone,
+        'role': e.role,
+        'pin': e.pin,
+    } for e in emps]
+
+@app.post('/employees')
+def create_employee(data: EmployeeCreate, db: Session = Depends(get_db)):
+    role = data.role.strip().lower()
+    if role not in ('orderer', 'picker', 'manager'):
+        raise HTTPException(status_code=400, detail='Vai trò không hợp lệ')
+    pin = _generate_unique_pin(db)
+    emp = Employee(name=data.name.strip(), phone=data.phone.strip(), role=role, pin=pin)
+    db.add(emp)
+    db.commit()
+    db.refresh(emp)
+    return {'status': 'created', 'id': emp.id, 'pin': emp.pin}
+
+@app.put('/employees/{emp_id}')
+def update_employee(emp_id: int, data: EmployeeUpdate, db: Session = Depends(get_db)):
+    emp = db.query(Employee).filter(Employee.id == emp_id).first()
+    if not emp:
+        raise HTTPException(status_code=404, detail='Nhân viên không tồn tại')
+    role = data.role.strip().lower()
+    if role not in ('orderer', 'picker', 'manager'):
+        raise HTTPException(status_code=400, detail='Vai trò không hợp lệ')
+    emp.name = data.name.strip()
+    emp.phone = data.phone.strip()
+    emp.role = role
+    db.commit()
+    return {'status': 'updated'}
+
+@app.delete('/employees/{emp_id}')
+def delete_employee(emp_id: int, db: Session = Depends(get_db)):
+    emp = db.query(Employee).filter(Employee.id == emp_id).first()
+    if not emp:
+        raise HTTPException(status_code=404, detail='Nhân viên không tồn tại')
+    db.delete(emp)
+    db.commit()
+    return {'status': 'deleted'}
 
 # --- API SẢN PHẨM ---
 @app.get("/products")
@@ -928,11 +1124,87 @@ def get_pending_orders(db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get('/orders/approved')
+def get_approved_orders(db: Session = Depends(get_db)):
+    try:
+        orders = db.query(Order).filter(Order.status == 'approved').order_by(desc(Order.created_ts)).all()
+        return {'data': [_serialize_order(o) for o in orders], 'count': len(orders)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put('/orders/{order_id}/receive')
+def receive_order(order_id: int, data: ReceiveOrderRequest, db: Session = Depends(get_db)):
+    try:
+        order = db.query(Order).filter(Order.id == order_id).first()
+        if not order:
+            raise HTTPException(status_code=404, detail='Hóa đơn không tồn tại')
+        if order.status != 'approved':
+            raise HTTPException(status_code=400, detail='Chỉ nhận đơn ở trạng thái đã duyệt')
+        picker = db.query(Employee).filter(Employee.id == data.picker_id).first()
+        if not picker or picker.role != 'picker':
+            raise HTTPException(status_code=400, detail='Picker không hợp lệ')
+        order.status = 'assigned'
+        order.assigned_picker_id = picker.id
+        order.assigned_at = datetime.now()
+        db.commit()
+        return {'status': 'success', 'message': f'Đã nhận đơn #{order_id}'}
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get('/orders/assigned')
+def get_assigned_orders(picker_id: int, db: Session = Depends(get_db)):
+    try:
+        orders = db.query(Order).filter(Order.status == 'assigned', Order.assigned_picker_id == picker_id).order_by(desc(Order.created_ts)).all()
+        return {'data': [_serialize_order(o) for o in orders], 'count': len(orders)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put('/orders/{order_id}/deliver')
+def deliver_order(order_id: int, data: DeliverOrderRequest, db: Session = Depends(get_db)):
+    if not data.photo_path.strip():
+        raise HTTPException(status_code=400, detail='Bắt buộc chụp ảnh xác nhận giao hàng')
+    picker = db.query(Employee).filter(Employee.id == data.picker_id).first()
+    if not picker or picker.role != 'picker':
+        raise HTTPException(status_code=400, detail='Picker không hợp lệ')
+
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail='Hóa đơn không tồn tại')
+    if order.status != 'assigned':
+        raise HTTPException(status_code=400, detail='Chỉ giao đơn đã nhận')
+    if order.assigned_picker_id != picker.id:
+        raise HTTPException(status_code=403, detail='Bạn không phải người đã nhận đơn này')
+
+    proxy = PickerConfirmRequest(items=data.items)
+    result = confirm_order(order_id, proxy if data.items else None, db)
+    order.delivered_by_id = picker.id
+    order.delivered_at = datetime.now()
+    order.delivery_photo_path = data.photo_path.strip()
+    db.commit()
+    return result
+
+
+@app.get('/orders/management')
+def get_orders_management(limit: int = 200, db: Session = Depends(get_db)):
+    try:
+        orders = db.query(Order).order_by(desc(Order.created_ts)).limit(limit).all()
+        return {'data': [_serialize_order(o) for o in orders], 'count': len(orders)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/orders/accepted")
 def get_accepted_orders(db: Session = Depends(get_db)):
-    """Get all ACCEPTED orders (status='accepted') for picker to confirm."""
+    """Backward-compat endpoint: now returns APPROVED orders for picker receive step."""
     try:
-        orders = db.query(Order).filter(Order.status == 'accepted').order_by(desc(Order.created_ts)).all()
+        orders = db.query(Order).filter(Order.status == 'approved').order_by(desc(Order.created_ts)).all()
 
         result = []
         for o in orders:
@@ -1002,13 +1274,13 @@ def approve_order(order_id: int, db: Session = Depends(get_db)):
         if order.status != 'pending':
             raise HTTPException(status_code=400, detail="Chỉ có thể tiếp nhận đơn đang chờ duyệt")
 
-        order.status = 'accepted'
+        order.status = 'approved'
         order.is_draft = 1  # keep is_draft consistent (still not finalized)
         db.commit()
 
         return {
             "status": "success",
-            "message": f"Đơn #{order_id} đã được tiếp nhận, chuyển cho picker soạn hàng"
+            "message": f"Đơn #{order_id} đã được duyệt, chờ picker nhận"
         }
     except Exception as e:
         db.rollback()
@@ -1029,8 +1301,8 @@ def confirm_order(order_id: int, data: Optional[PickerConfirmRequest] = None, db
         if not order:
             raise HTTPException(status_code=404, detail="Hóa đơn không tồn tại")
 
-        if order.status != 'accepted':
-            raise HTTPException(status_code=400, detail="Chỉ có thể xác nhận đơn hàng đã được tiếp nhận")
+        if order.status not in ('assigned', 'accepted'):
+            raise HTTPException(status_code=400, detail="Chỉ có thể xác nhận đơn hàng đã được nhận")
 
         requested_map = {}
         for item in order.items:
