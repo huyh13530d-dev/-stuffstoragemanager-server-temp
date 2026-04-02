@@ -116,3 +116,16 @@ class OrderItem(Base):
     quantity = Column(Integer)
     price = Column(Integer)
     order = relationship("Order", back_populates="items")
+
+
+class Employee(Base):
+    __tablename__ = "employees"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, index=True)
+    phone = Column(String, default="")
+    role = Column(String, index=True)
+    pin = Column(String, unique=True, index=True)
+    created_at = Column(DateTime, default=datetime.now)
+
+    assigned_orders = relationship("Order", foreign_keys=[Order.assigned_picker_id], back_populates="assigned_picker")
+    delivered_orders = relationship("Order", foreign_keys=[Order.delivered_by_id], back_populates="delivered_by")

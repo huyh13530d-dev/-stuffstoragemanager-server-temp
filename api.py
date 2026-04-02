@@ -1,7 +1,8 @@
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional
-from sqlalchemy import desc, func
+from datetime import datetime
+from sqlalchemy import desc, func, Column, Integer, String, DateTime
 from sqlalchemy.orm import Session
 try:
     from backend import database as _db
@@ -16,12 +17,20 @@ Order = _db.Order
 OrderItem = _db.OrderItem
 Customer = _db.Customer
 DebtLog = _db.DebtLog
-Employee = _db.Employee
+Employee = getattr(_db, "Employee", None)
 engine = _db.engine
 is_sqlite = _db.is_sqlite
 Base = _db.Base
+if Employee is None:
+    class Employee(Base):
+        __tablename__ = "employees"
+        id = Column(Integer, primary_key=True, index=True)
+        name = Column(String, index=True)
+        phone = Column(String, default="")
+        role = Column(String, index=True)
+        pin = Column(String, unique=True, index=True)
+        created_at = Column(DateTime, default=datetime.now)
 from sqlalchemy import text
-from datetime import datetime
 
 
 class DebtLogCreate(BaseModel):
