@@ -4,9 +4,22 @@ from typing import List, Optional
 from sqlalchemy import desc, func
 from sqlalchemy.orm import Session
 try:
-    from database import SessionLocal, Product, Variant, Area, Order, OrderItem, Customer, DebtLog, Employee, engine, is_sqlite, Base
-except ImportError:
-    from backend.database import SessionLocal, Product, Variant, Area, Order, OrderItem, Customer, DebtLog, Employee, engine, is_sqlite, Base
+    from backend import database as _db
+except ModuleNotFoundError:
+    import database as _db
+
+SessionLocal = _db.SessionLocal
+Product = _db.Product
+Variant = _db.Variant
+Area = _db.Area
+Order = _db.Order
+OrderItem = _db.OrderItem
+Customer = _db.Customer
+DebtLog = _db.DebtLog
+Employee = _db.Employee
+engine = _db.engine
+is_sqlite = _db.is_sqlite
+Base = _db.Base
 from sqlalchemy import text
 from datetime import datetime
 
