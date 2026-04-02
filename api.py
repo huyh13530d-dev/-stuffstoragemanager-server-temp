@@ -198,11 +198,13 @@ class VariantUpdate(BaseModel):
     stock: int
 
 class ProductUpdate(BaseModel):
+    code: str = ""
     name: str
     image_path: str
     variants: List[VariantUpdate]
 
 class ProductCreate(BaseModel):
+    code: str = ""
     name: str
     description: str
     image_path: str
@@ -240,7 +242,8 @@ class CustomerUpdate(BaseModel):
 def get_products(search: str = "", db: Session = Depends(get_db)):
     query = db.query(Product)
     if search:
-        query = query.filter(Product.name.contains(search))
+        s = f"%{search}%"
+        query = query.filter((Product.name.ilike(s)) | (Product.code.ilike(s)))
     
     products = query.order_by(desc(Product.id)).all()
     results = []
@@ -253,6 +256,7 @@ def get_products(search: str = "", db: Session = Depends(get_db)):
         
         results.append({
             "id": p.id, 
+            "code": p.code or p.name,
             "name": p.name, 
             "image": p.image_path, 
             "price_range": price_range,
@@ -262,7 +266,8 @@ def get_products(search: str = "", db: Session = Depends(get_db)):
 
 @app.post("/products")
 def create_product(p: ProductCreate, db: Session = Depends(get_db)):
-    new_prod = Product(name=p.name, description=p.description, image_path=p.image_path)
+    code = (p.code or "").strip() or p.name
+    new_prod = Product(code=code, name=p.name, description=p.description, image_path=p.image_path)
     db.add(new_prod)
     db.commit()
     db.refresh(new_prod)
@@ -277,6 +282,7 @@ def update_product(product_id: int, p_data: ProductUpdate, db: Session = Depends
     product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
         raise HTTPException(status_code=404)
+    product.code = (p_data.code or "").strip() or p_data.name
     product.name = p_data.name
     product.image_path = p_data.image_path
     

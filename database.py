@@ -33,6 +33,7 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 class Product(Base):
     __tablename__ = "products"
     id = Column(Integer, primary_key=True, index=True)
+    code = Column(String, index=True, default="")
     name = Column(String, index=True)
     description = Column(String, default="")
     image_path = Column(String, default="") 
