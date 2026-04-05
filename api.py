@@ -629,6 +629,60 @@ def create_customer_manual(data: CustomerCreate, db: Session = Depends(get_db)):
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.post("/checkout/desktop-dispatch")
+def checkout_desktop_dispatch(data: CheckoutRequest, db: Session = Depends(get_db)):
+    """
+    Desktop dispatch flow:
+    - Skip manager approval step
+    - Send order directly to picker queue (status='approved')
+    - Stock/debt are still applied only when picker delivers/confirms
+    """
+    try:
+        total = sum([item.quantity * item.price for item in data.cart])
+
+        c_name = data.customer_name.strip()
+        customer = None
+
+        if c_name:
+            customer = db.query(Customer).filter(func.lower(Customer.name) == func.lower(c_name)).first()
+
+            if not customer:
+                customer = Customer(name=c_name, phone=data.customer_phone, debt=0, area_id=_get_default_area_id(db))
+                db.add(customer)
+                db.flush()
+
+        new_order = Order(
+            total_amount=total,
+            customer_name=customer.name if customer else "Khách lẻ",
+            customer_id=customer.id if customer else None,
+            is_draft=1,
+            status='approved'
+        )
+        new_order.created_ts = int(datetime.utcnow().timestamp() * 1000)
+        db.add(new_order)
+        db.flush()
+
+        for item in data.cart:
+            db.add(OrderItem(
+                order_id=new_order.id,
+                product_name=item.product_name,
+                variant_id=item.variant_id,
+                variant_info=f"{item.color}-{item.size}",
+                quantity=item.quantity,
+                price=item.price
+            ))
+
+        db.commit()
+        return {
+            "status": "success",
+            "order_id": new_order.id,
+            "message": "Đơn desktop đã gửi picker, chờ nhận xử lý"
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/customers")
 def get_customers(db: Session = Depends(get_db)):
     custs = db.query(Customer).order_by(desc(Customer.id)).all()
