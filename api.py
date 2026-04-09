@@ -442,11 +442,24 @@ class DeliverOrderRequest(BaseModel):
     picker_id: int
     photo_path: str
     items: List[PickerConfirmItem] = []
+    picker_note: str = ""
 
 
-def _deliver_order_internal(order_id: int, picker_id: int, photo_path: str, items: List[PickerConfirmItem], db: Session):
-    if not photo_path.strip():
+def _deliver_order_internal(order_id: int, picker_id: int, photo_path: str, items: List[PickerConfirmItem], db: Session, picker_note: str = ""):
+    normalized_photo_path = photo_path.strip()
+    if not normalized_photo_path:
         raise HTTPException(status_code=400, detail='Bắt buộc chụp ảnh xác nhận giao hàng')
+
+    if normalized_photo_path.startswith('/delivery-proofs/'):
+        file_name = os.path.basename(normalized_photo_path)
+        abs_path = os.path.join(_delivery_upload_dir, file_name)
+        if not os.path.exists(abs_path):
+            raise HTTPException(status_code=400, detail='Ảnh xác nhận không tồn tại trên server, vui lòng chụp và gửi lại')
+        normalized_photo_path = f'/delivery-proofs/{file_name}'
+    elif normalized_photo_path.startswith('http://') or normalized_photo_path.startswith('https://'):
+        pass
+    else:
+        raise HTTPException(status_code=400, detail='Ứng dụng mobile cũ chưa hỗ trợ upload ảnh. Vui lòng cập nhật app mobile mới nhất')
 
     picker = db.query(Employee).filter(Employee.id == picker_id).first()
     if not picker or picker.role != 'picker':
@@ -461,10 +474,10 @@ def _deliver_order_internal(order_id: int, picker_id: int, photo_path: str, item
         raise HTTPException(status_code=403, detail='Bạn không phải người đã nhận đơn này')
 
     proxy = PickerConfirmRequest(items=items)
-    result = confirm_order(order_id, proxy if items else None, db)
+    result = confirm_order(order_id, proxy if items else None, db, picker_note=picker_note)
     order.delivered_by_id = picker.id
     order.delivered_at = datetime.now()
-    order.delivery_photo_path = photo_path.strip()
+    order.delivery_photo_path = normalized_photo_path
     db.commit()
     return result
 
@@ -1321,7 +1334,7 @@ def get_assigned_orders(picker_id: int, db: Session = Depends(get_db)):
 
 @app.put('/orders/{order_id}/deliver')
 def deliver_order(order_id: int, data: DeliverOrderRequest, db: Session = Depends(get_db)):
-    return _deliver_order_internal(order_id, data.picker_id, data.photo_path, data.items, db)
+    return _deliver_order_internal(order_id, data.picker_id, data.photo_path, data.items, db, picker_note=data.picker_note)
 
 
 @app.put('/orders/{order_id}/deliver-with-photo')
@@ -1329,6 +1342,7 @@ async def deliver_order_with_photo(
     order_id: int,
     picker_id: int = Form(...),
     items_json: str = Form('[]'),
+    picker_note: str = Form(''),
     photo: UploadFile = File(...),
     db: Session = Depends(get_db),
 ):
@@ -1341,7 +1355,7 @@ async def deliver_order_with_photo(
 
     normalized_items = _normalize_picker_confirm_items(raw_items)
     photo_path = _save_delivery_photo_file(order_id, photo)
-    return _deliver_order_internal(order_id, picker_id, photo_path, normalized_items, db)
+    return _deliver_order_internal(order_id, picker_id, photo_path, normalized_items, db, picker_note=picker_note)
 
 
 @app.get('/delivery-proofs/pending')
@@ -1478,7 +1492,7 @@ def approve_order(order_id: int, db: Session = Depends(get_db)):
 
 
 @app.put("/orders/{order_id}/confirm")
-def confirm_order(order_id: int, data: Optional[PickerConfirmRequest] = None, db: Session = Depends(get_db)):
+def confirm_order(order_id: int, data: Optional[PickerConfirmRequest] = None, db: Session = Depends(get_db), picker_note: str = ""):
     """
     Picker confirms delivery → applies to database:
     - Deduct stock from variants (by picked quantities)
@@ -1562,8 +1576,17 @@ def confirm_order(order_id: int, data: Optional[PickerConfirmRequest] = None, db
 
         order.total_amount = delivered_total
         order.picker_note = ""
+        shortage_note = ""
         if shortage_parts:
-            order.picker_note = "Thiếu hàng: " + "; ".join(shortage_parts)
+            shortage_note = "Thiếu hàng: " + "; ".join(shortage_parts)
+
+        manual_note = (picker_note or "").strip()
+        if shortage_note and manual_note:
+            order.picker_note = f"{shortage_note} | Ghi chú picker: {manual_note}"
+        elif shortage_note:
+            order.picker_note = shortage_note
+        elif manual_note:
+            order.picker_note = manual_note
 
         order.status = 'completed'
         order.is_draft = 0

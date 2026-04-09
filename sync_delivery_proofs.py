@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 import requests
+from requests import HTTPError
 
 
 def parse_args():
@@ -55,6 +56,7 @@ def main():
 
     max_seen = last_order_id
     downloaded = 0
+    missing = 0
 
     for row in rows:
         if not isinstance(row, dict):
@@ -78,14 +80,22 @@ def main():
         else:
             photo_url = f"{api_base}{download_url}"
 
-        r = requests.get(photo_url, timeout=60)
-        r.raise_for_status()
-        target_path.write_bytes(r.content)
-        downloaded += 1
-        print(f"Đã tải: #{order_id} -> {target_path.name}")
+        try:
+            r = requests.get(photo_url, timeout=60)
+            r.raise_for_status()
+            target_path.write_bytes(r.content)
+            downloaded += 1
+            print(f"Đã tải: #{order_id} -> {target_path.name}")
+        except HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status == 404:
+                missing += 1
+                print(f"Bỏ qua #{order_id}: ảnh không còn trên server ({photo_url})")
+                continue
+            raise
 
     save_state(state_path, max_seen)
-    print(f"Hoàn tất. Tải mới: {downloaded}, last_order_id={max_seen}")
+    print(f"Hoàn tất. Tải mới: {downloaded}, thiếu trên server: {missing}, last_order_id={max_seen}")
 
 
 if __name__ == '__main__':
