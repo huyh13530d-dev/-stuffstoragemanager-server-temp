@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 import os
 import uuid
 import json
+import requests
 try:
     from backend import database as _db
 except ModuleNotFoundError:
@@ -199,6 +200,27 @@ def ensure_picker_note_column():
     except Exception as e:
         print("Warning: ensure_picker_note_column failed:", e)
 
+def ensure_telegram_columns():
+    try:
+        with engine.connect() as conn:
+            if is_sqlite:
+                info = conn.execute(text("PRAGMA table_info('orders')")).fetchall()
+                cols = [r[1] for r in info]
+                if 'telegram_file_id' not in cols:
+                    conn.execute(text("ALTER TABLE orders ADD COLUMN telegram_file_id VARCHAR DEFAULT ''"))
+                if 'telegram_message_id' not in cols:
+                    conn.execute(text("ALTER TABLE orders ADD COLUMN telegram_message_id VARCHAR DEFAULT ''"))
+                conn.commit()
+            else:
+                try:
+                    conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS telegram_file_id VARCHAR DEFAULT ''"))
+                    conn.execute(text("ALTER TABLE orders ADD COLUMN IF NOT EXISTS telegram_message_id VARCHAR DEFAULT ''"))
+                    conn.commit()
+                except Exception:
+                    conn.rollback()
+    except Exception as e:
+        print("Warning: ensure_telegram_columns failed:", e)
+
 def ensure_area_schema_and_seed():
     seed_areas = ["Chợ đêm", "Chợ hàn", "Hội An", "Nha Trang"]
     try:
@@ -297,9 +319,28 @@ def ensure_order_flow_columns():
 
 ensure_status_column()
 ensure_picker_note_column()
+ensure_telegram_columns()
 ensure_area_schema_and_seed()
 ensure_employee_schema_and_seed()
 ensure_order_flow_columns()
+
+
+def _send_photo_to_telegram(photo_path: str, caption: str) -> dict:
+    token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+    if not token or not chat_id:
+        return {}
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    try:
+        with open(photo_path, 'rb') as f:
+            files = {'photo': f}
+            data = {'chat_id': chat_id, 'caption': caption}
+            r = requests.post(url, files=files, data=data, timeout=30)
+        if r.status_code == 200:
+            return r.json().get('result') or {}
+    except Exception as e:
+        print("Warning: telegram send failed:", e)
+    return {}
 
 def _get_default_area_id(db: Session):
     area = db.query(Area).filter(Area.name == "Chợ hàn").first()
@@ -450,12 +491,14 @@ def _deliver_order_internal(order_id: int, picker_id: int, photo_path: str, item
     if not normalized_photo_path:
         raise HTTPException(status_code=400, detail='Bắt buộc chụp ảnh xác nhận giao hàng')
 
+    abs_photo_path = None
     if normalized_photo_path.startswith('/delivery-proofs/'):
         file_name = os.path.basename(normalized_photo_path)
         abs_path = os.path.join(_delivery_upload_dir, file_name)
         if not os.path.exists(abs_path):
             raise HTTPException(status_code=400, detail='Ảnh xác nhận không tồn tại trên server, vui lòng chụp và gửi lại')
         normalized_photo_path = f'/delivery-proofs/{file_name}'
+        abs_photo_path = abs_path
     elif normalized_photo_path.startswith('http://') or normalized_photo_path.startswith('https://'):
         pass
     else:
@@ -479,6 +522,26 @@ def _deliver_order_internal(order_id: int, picker_id: int, photo_path: str, item
     order.delivered_at = datetime.now()
     order.delivery_photo_path = normalized_photo_path
     db.commit()
+
+    if abs_photo_path:
+        try:
+            caption_parts = [
+                f"Đơn #{order.id} • {order.customer_name or 'Khách lẻ'}",
+                f"Picker: {picker.name}",
+                order.delivered_at.strftime('%Y-%m-%d %H:%M') if order.delivered_at else '',
+            ]
+            if order.picker_note:
+                caption_parts.append(f"Ghi chú: {order.picker_note}")
+            caption = "\n".join([p for p in caption_parts if p])
+            result = _send_photo_to_telegram(abs_photo_path, caption)
+            if result:
+                photos = result.get('photo') or []
+                if photos:
+                    order.telegram_file_id = photos[-1].get('file_id', '') or ''
+                order.telegram_message_id = str(result.get('message_id') or '')
+                db.commit()
+        except Exception as e:
+            print("Warning: telegram backup failed:", e)
     return result
 
 # --- API NHÂN VIÊN / PHÂN QUYỀN ---

@@ -100,6 +100,8 @@ class Order(Base):
     delivered_by_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
     delivered_at = Column(DateTime, nullable=True)
     delivery_photo_path = Column(String, default="")
+    telegram_file_id = Column(String, default="")
+    telegram_message_id = Column(String, default="")
 
     items = relationship("OrderItem", back_populates="order")
     customer_rel = relationship("Customer", back_populates="orders")
