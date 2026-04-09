@@ -1,9 +1,13 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
 from sqlalchemy import desc, func, Column, Integer, String, DateTime
 from sqlalchemy.orm import Session
+import os
+import uuid
+import json
 try:
     from backend import database as _db
 except ModuleNotFoundError:
@@ -47,6 +51,54 @@ class OrderDateUpdate(BaseModel):
     created_at: str  # YYYY-MM-DD HH:MM
 
 app = FastAPI()
+
+_delivery_upload_dir = os.environ.get("DELIVERY_UPLOAD_DIR", "").strip()
+if not _delivery_upload_dir:
+    _delivery_upload_dir = "/tmp/delivery_proofs" if not is_sqlite else os.path.join(os.path.dirname(__file__), "delivery_proofs")
+os.makedirs(_delivery_upload_dir, exist_ok=True)
+
+_MAX_DELIVERY_PHOTO_BYTES = int(os.environ.get("MAX_DELIVERY_PHOTO_MB", "8")) * 1024 * 1024
+
+
+def _save_delivery_photo_file(order_id: int, photo: UploadFile) -> str:
+    filename = (photo.filename or "proof.jpg").strip()
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in (".jpg", ".jpeg", ".png", ".webp", ".heic"):
+        raise HTTPException(status_code=400, detail="Ảnh giao hàng phải là jpg/png/webp/heic")
+
+    safe_name = f"order_{order_id}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}{ext}"
+    abs_path = os.path.join(_delivery_upload_dir, safe_name)
+
+    total = 0
+    with open(abs_path, "wb") as out:
+        while True:
+            chunk = photo.file.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _MAX_DELIVERY_PHOTO_BYTES:
+                out.close()
+                try:
+                    os.remove(abs_path)
+                except Exception:
+                    pass
+                raise HTTPException(status_code=400, detail=f"Ảnh vượt giới hạn {_MAX_DELIVERY_PHOTO_BYTES // (1024 * 1024)}MB")
+            out.write(chunk)
+
+    return f"/delivery-proofs/{safe_name}"
+
+
+def _normalize_picker_confirm_items(raw_items: list) -> List['PickerConfirmItem']:
+    normalized = []
+    for x in raw_items:
+        if not isinstance(x, dict):
+            continue
+        normalized.append(PickerConfirmItem(
+            order_item_id=x.get('order_item_id'),
+            variant_id=x.get('variant_id'),
+            picked_qty=int(x.get('picked_qty') or 0),
+        ))
+    return normalized
 
 def ensure_created_ts_columns():
     if not is_sqlite:
@@ -390,6 +442,31 @@ class DeliverOrderRequest(BaseModel):
     picker_id: int
     photo_path: str
     items: List[PickerConfirmItem] = []
+
+
+def _deliver_order_internal(order_id: int, picker_id: int, photo_path: str, items: List[PickerConfirmItem], db: Session):
+    if not photo_path.strip():
+        raise HTTPException(status_code=400, detail='Bắt buộc chụp ảnh xác nhận giao hàng')
+
+    picker = db.query(Employee).filter(Employee.id == picker_id).first()
+    if not picker or picker.role != 'picker':
+        raise HTTPException(status_code=400, detail='Picker không hợp lệ')
+
+    order = db.query(Order).filter(Order.id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail='Hóa đơn không tồn tại')
+    if order.status != 'assigned':
+        raise HTTPException(status_code=400, detail='Chỉ giao đơn đã nhận')
+    if order.assigned_picker_id != picker.id:
+        raise HTTPException(status_code=403, detail='Bạn không phải người đã nhận đơn này')
+
+    proxy = PickerConfirmRequest(items=items)
+    result = confirm_order(order_id, proxy if items else None, db)
+    order.delivered_by_id = picker.id
+    order.delivered_at = datetime.now()
+    order.delivery_photo_path = photo_path.strip()
+    db.commit()
+    return result
 
 # --- API NHÂN VIÊN / PHÂN QUYỀN ---
 @app.post('/auth/pin-login')
@@ -1244,27 +1321,64 @@ def get_assigned_orders(picker_id: int, db: Session = Depends(get_db)):
 
 @app.put('/orders/{order_id}/deliver')
 def deliver_order(order_id: int, data: DeliverOrderRequest, db: Session = Depends(get_db)):
-    if not data.photo_path.strip():
-        raise HTTPException(status_code=400, detail='Bắt buộc chụp ảnh xác nhận giao hàng')
-    picker = db.query(Employee).filter(Employee.id == data.picker_id).first()
-    if not picker or picker.role != 'picker':
-        raise HTTPException(status_code=400, detail='Picker không hợp lệ')
+    return _deliver_order_internal(order_id, data.picker_id, data.photo_path, data.items, db)
 
-    order = db.query(Order).filter(Order.id == order_id).first()
-    if not order:
-        raise HTTPException(status_code=404, detail='Hóa đơn không tồn tại')
-    if order.status != 'assigned':
-        raise HTTPException(status_code=400, detail='Chỉ giao đơn đã nhận')
-    if order.assigned_picker_id != picker.id:
-        raise HTTPException(status_code=403, detail='Bạn không phải người đã nhận đơn này')
 
-    proxy = PickerConfirmRequest(items=data.items)
-    result = confirm_order(order_id, proxy if data.items else None, db)
-    order.delivered_by_id = picker.id
-    order.delivered_at = datetime.now()
-    order.delivery_photo_path = data.photo_path.strip()
-    db.commit()
-    return result
+@app.put('/orders/{order_id}/deliver-with-photo')
+async def deliver_order_with_photo(
+    order_id: int,
+    picker_id: int = Form(...),
+    items_json: str = Form('[]'),
+    photo: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    try:
+        raw_items = json.loads(items_json or '[]')
+        if not isinstance(raw_items, list):
+            raw_items = []
+    except Exception:
+        raise HTTPException(status_code=400, detail='Dữ liệu items không hợp lệ')
+
+    normalized_items = _normalize_picker_confirm_items(raw_items)
+    photo_path = _save_delivery_photo_file(order_id, photo)
+    return _deliver_order_internal(order_id, picker_id, photo_path, normalized_items, db)
+
+
+@app.get('/delivery-proofs/pending')
+def list_pending_delivery_proofs(since_order_id: int = 0, limit: int = 200, db: Session = Depends(get_db)):
+    lim = 200 if limit <= 0 else min(limit, 500)
+    q = db.query(Order).filter(
+        Order.status == 'completed',
+        Order.delivery_photo_path.isnot(None),
+        Order.delivery_photo_path != '',
+        Order.id > since_order_id,
+    ).order_by(Order.id.asc()).limit(lim)
+
+    orders = q.all()
+    data = []
+    for o in orders:
+        rel = (o.delivery_photo_path or '').strip()
+        file_name = os.path.basename(rel)
+        data.append({
+            'order_id': o.id,
+            'delivered_at': o.delivered_at.strftime('%Y-%m-%d %H:%M') if o.delivered_at else '',
+            'customer_name': o.customer_name or 'Khách lẻ',
+            'photo_path': rel,
+            'file_name': file_name,
+            'download_url': rel if rel.startswith('/delivery-proofs/') else f'/delivery-proofs/{file_name}',
+        })
+    return {'data': data, 'count': len(data)}
+
+
+@app.get('/delivery-proofs/{file_name}')
+def get_delivery_proof_file(file_name: str):
+    safe_name = os.path.basename(file_name)
+    if safe_name != file_name:
+        raise HTTPException(status_code=400, detail='Tên file không hợp lệ')
+    abs_path = os.path.join(_delivery_upload_dir, safe_name)
+    if not os.path.exists(abs_path):
+        raise HTTPException(status_code=404, detail='Không tìm thấy ảnh')
+    return FileResponse(abs_path)
 
 
 @app.get('/orders/management')
