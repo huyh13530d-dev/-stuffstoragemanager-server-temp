@@ -361,6 +361,18 @@ def _send_photo_to_telegram(photo_path: str, caption: str) -> dict:
     chat_id = os.environ.get('TELEGRAM_CHAT_ID')
     if not token or not chat_id:
         return {}
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    try:
+        with open(photo_path, 'rb') as f:
+            files = {'photo': f}
+            data = {'chat_id': chat_id, 'caption': caption}
+            r = requests.post(url, files=files, data=data, timeout=30)
+        if r.status_code == 200:
+            return r.json().get('result') or {}
+        print("Warning: telegram send failed:", r.status_code, r.text)
+    except Exception as e:
+        print("Warning: telegram send failed:", e)
+    return {}
 
 
 def _send_product_image_to_telegram(photo_path: str, caption: str) -> None:
@@ -563,7 +575,7 @@ def _deliver_order_internal(order_id: int, picker_id: int, photo_path: str, item
         raise HTTPException(status_code=403, detail='Bạn không phải người đã nhận đơn này')
 
     proxy = PickerConfirmRequest(items=items)
-    result = confirm_order(order_id, proxy if items else None, db, picker_note=picker_note)
+    confirm_result = confirm_order(order_id, proxy if items else None, db, picker_note=picker_note)
     order.delivered_by_id = picker.id
     order.delivered_at = _now_vn()
     order.delivery_photo_path = normalized_photo_path
@@ -579,16 +591,16 @@ def _deliver_order_internal(order_id: int, picker_id: int, photo_path: str, item
             if order.picker_note:
                 caption_parts.append(f"Ghi chú: {order.picker_note}")
             caption = "\n".join([p for p in caption_parts if p])
-            result = _send_photo_to_telegram(abs_photo_path, caption)
-            if result:
-                photos = result.get('photo') or []
+            telegram_result = _send_photo_to_telegram(abs_photo_path, caption)
+            if telegram_result:
+                photos = telegram_result.get('photo') or []
                 if photos:
                     order.telegram_file_id = photos[-1].get('file_id', '') or ''
-                order.telegram_message_id = str(result.get('message_id') or '')
+                order.telegram_message_id = str(telegram_result.get('message_id') or '')
                 db.commit()
         except Exception as e:
             print("Warning: telegram backup failed:", e)
-    return result
+    return confirm_result
 
 # --- API NHÂN VIÊN / PHÂN QUYỀN ---
 @app.post('/auth/pin-login')
