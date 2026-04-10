@@ -5,4 +5,4 @@ builder = "nixpacks"
 installCmd = "pip install -r requirements.txt"
 
 [deploy]
-startCommand = "bash -lc \"apt-get update && apt-get install -y postgresql-client && python backup_postgres_to_telegram.py --label railway\""
+startCommand = "uvicorn api:app --host 0.0.0.0 --port $PORT"

@@ -3,7 +3,7 @@ import os
 import sys
 import tempfile
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 
@@ -70,7 +70,7 @@ def main() -> int:
     token = _get_bot_token()
     chat_id = _get_chat_id()
 
-    stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     label = args.label.strip() or "backup"
     file_name = f"{label}_backup_{stamp}.dump"
 

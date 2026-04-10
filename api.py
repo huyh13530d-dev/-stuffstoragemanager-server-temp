@@ -59,6 +59,7 @@ if not _delivery_upload_dir:
 os.makedirs(_delivery_upload_dir, exist_ok=True)
 
 _MAX_DELIVERY_PHOTO_BYTES = int(os.environ.get("MAX_DELIVERY_PHOTO_MB", "8")) * 1024 * 1024
+_product_upload_dir = _delivery_upload_dir
 
 
 def _save_delivery_photo_file(order_id: int, photo: UploadFile) -> str:
@@ -87,6 +88,25 @@ def _save_delivery_photo_file(order_id: int, photo: UploadFile) -> str:
             out.write(chunk)
 
     return f"/delivery-proofs/{safe_name}"
+
+
+def _save_product_image_file(photo: UploadFile) -> str:
+    filename = (photo.filename or "product.jpg").strip()
+    ext = os.path.splitext(filename)[1].lower()
+    if ext not in (".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp"):
+        raise HTTPException(status_code=400, detail="Ảnh sản phẩm phải là jpg/png/webp/heic/bmp")
+
+    safe_name = f"product_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}{ext}"
+    abs_path = os.path.join(_product_upload_dir, safe_name)
+
+    with open(abs_path, "wb") as out:
+        while True:
+            chunk = photo.file.read(1024 * 1024)
+            if not chunk:
+                break
+            out.write(chunk)
+
+    return f"/product-images/{safe_name}"
 
 
 def _normalize_picker_confirm_items(raw_items: list) -> List['PickerConfirmItem']:
@@ -330,6 +350,21 @@ def _send_photo_to_telegram(photo_path: str, caption: str) -> dict:
     chat_id = os.environ.get('TELEGRAM_CHAT_ID')
     if not token or not chat_id:
         return {}
+
+
+def _send_product_image_to_telegram(photo_path: str, caption: str) -> None:
+    token = os.environ.get('TELEGRAM_DB_BOT_TOKEN')
+    chat_id = os.environ.get('TELEGRAM_DB_CHAT_ID')
+    if not token or not chat_id:
+        return
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
+    try:
+        with open(photo_path, 'rb') as f:
+            files = {'photo': f}
+            data = {'chat_id': chat_id, 'caption': caption}
+            requests.post(url, files=files, data=data, timeout=30)
+    except Exception as e:
+        print("Warning: telegram product image send failed:", e)
     url = f"https://api.telegram.org/bot{token}/sendPhoto"
     try:
         with open(photo_path, 'rb') as f:
@@ -647,6 +682,32 @@ def create_product(p: ProductCreate, db: Session = Depends(get_db)):
         db.add(Variant(product_id=new_prod.id, color=v.color, size=v.size, price=v.price, stock=v.stock))
     db.commit()
     return {"status": "ok"}
+
+
+@app.post("/product-images/upload")
+def upload_product_image(file: UploadFile = File(...)):
+    path = _save_product_image_file(file)
+    abs_path = None
+    if path.startswith('/product-images/'):
+        abs_path = os.path.join(_product_upload_dir, os.path.basename(path))
+    if abs_path:
+        try:
+            caption = f"Ảnh sản phẩm • {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            _send_product_image_to_telegram(abs_path, caption)
+        except Exception as e:
+            print("Warning: product image telegram backup failed:", e)
+    return {"path": path}
+
+
+@app.get('/product-images/{file_name}')
+def get_product_image_file(file_name: str):
+    safe_name = os.path.basename(file_name)
+    if safe_name != file_name:
+        raise HTTPException(status_code=400, detail='Tên file không hợp lệ')
+    abs_path = os.path.join(_product_upload_dir, safe_name)
+    if not os.path.exists(abs_path):
+        raise HTTPException(status_code=404, detail='Không tìm thấy ảnh')
+    return FileResponse(abs_path)
 
 @app.put("/products/{product_id}")
 def update_product(product_id: int, p_data: ProductUpdate, db: Session = Depends(get_db)):
