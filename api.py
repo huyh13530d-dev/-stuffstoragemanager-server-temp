@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from sqlalchemy import desc, func, Column, Integer, String, DateTime
 from sqlalchemy.orm import Session
 import os
@@ -26,6 +26,17 @@ Employee = getattr(_db, "Employee", None)
 engine = _db.engine
 is_sqlite = _db.is_sqlite
 Base = _db.Base
+VN_TZ = timezone(timedelta(hours=7))
+
+
+def _now_vn() -> datetime:
+    return datetime.now(VN_TZ).replace(tzinfo=None)
+
+
+def _now_vn_ts() -> int:
+    return int(datetime.now(VN_TZ).timestamp() * 1000)
+
+
 if Employee is None:
     class Employee(Base):
         __tablename__ = "employees"
@@ -34,7 +45,7 @@ if Employee is None:
         phone = Column(String, default="")
         role = Column(String, index=True)
         pin = Column(String, unique=True, index=True)
-        created_at = Column(DateTime, default=datetime.now)
+        created_at = Column(DateTime, default=_now_vn)
 from sqlalchemy import text
 
 
@@ -68,7 +79,7 @@ def _save_delivery_photo_file(order_id: int, photo: UploadFile) -> str:
     if ext not in (".jpg", ".jpeg", ".png", ".webp", ".heic"):
         raise HTTPException(status_code=400, detail="Ảnh giao hàng phải là jpg/png/webp/heic")
 
-    safe_name = f"order_{order_id}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}{ext}"
+    safe_name = f"order_{order_id}_{_now_vn().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}{ext}"
     abs_path = os.path.join(_delivery_upload_dir, safe_name)
 
     total = 0
@@ -96,7 +107,7 @@ def _save_product_image_file(photo: UploadFile) -> str:
     if ext not in (".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp"):
         raise HTTPException(status_code=400, detail="Ảnh sản phẩm phải là jpg/png/webp/heic/bmp")
 
-    safe_name = f"product_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}{ext}"
+    safe_name = f"product_{_now_vn().strftime('%Y%m%d%H%M%S')}_{uuid.uuid4().hex[:8]}{ext}"
     abs_path = os.path.join(_product_upload_dir, safe_name)
 
     with open(abs_path, "wb") as out:
@@ -554,7 +565,7 @@ def _deliver_order_internal(order_id: int, picker_id: int, photo_path: str, item
     proxy = PickerConfirmRequest(items=items)
     result = confirm_order(order_id, proxy if items else None, db, picker_note=picker_note)
     order.delivered_by_id = picker.id
-    order.delivered_at = datetime.now()
+    order.delivered_at = _now_vn()
     order.delivery_photo_path = normalized_photo_path
     db.commit()
 
@@ -692,7 +703,7 @@ def upload_product_image(file: UploadFile = File(...)):
         abs_path = os.path.join(_product_upload_dir, os.path.basename(path))
     if abs_path:
         try:
-            caption = f"Ảnh sản phẩm • {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            caption = f"Ảnh sản phẩm • {_now_vn().strftime('%Y-%m-%d %H:%M')}"
             _send_product_image_to_telegram(abs_path, caption)
         except Exception as e:
             print("Warning: product image telegram backup failed:", e)
@@ -832,7 +843,7 @@ def create_customer_manual(data: CustomerCreate, db: Session = Depends(get_db)):
         db.flush()
         
         if data.debt != 0:
-            db.add(DebtLog(customer_id=new_cust.id, change_amount=data.debt, new_balance=data.debt, note="Khởi tạo thủ công", created_ts=int(datetime.utcnow().timestamp() * 1000)))
+            db.add(DebtLog(customer_id=new_cust.id, change_amount=data.debt, new_balance=data.debt, note="Khởi tạo thủ công", created_ts=_now_vn_ts()))
         
         db.commit()
         db.refresh(new_cust)
@@ -873,7 +884,7 @@ def checkout_desktop_dispatch(data: CheckoutRequest, db: Session = Depends(get_d
             is_draft=1,
             status='approved'
         )
-        new_order.created_ts = int(datetime.utcnow().timestamp() * 1000)
+        new_order.created_ts = _now_vn_ts()
         db.add(new_order)
         db.flush()
 
@@ -926,7 +937,7 @@ def update_customer_excel(cid: int, data: CustomerUpdate, db: Session = Depends(
     cust.area_id = data.area_id
     
     if diff != 0:
-        db.add(DebtLog(customer_id=cust.id, change_amount=diff, new_balance=cust.debt, note="Điều chỉnh thủ công", created_ts=int(datetime.utcnow().timestamp() * 1000)))
+        db.add(DebtLog(customer_id=cust.id, change_amount=diff, new_balance=cust.debt, note="Điều chỉnh thủ công", created_ts=_now_vn_ts()))
         
     db.commit()
     return {"status": "ok"}
@@ -1035,7 +1046,7 @@ def create_debt_log(cid: int, data: DebtLogCreate, db: Session = Depends(get_db)
         raise HTTPException(status_code=404, detail="Khách hàng không tồn tại")
     try:
         amt = data.change_amount
-        now = datetime.now() 
+        now = _now_vn()
 
         display_dt = now
         if data.created_at:
@@ -1160,7 +1171,7 @@ def checkout(data: CheckoutRequest, db: Session = Depends(get_db)):
             status='completed'
         )
         # set high-resolution timestamp
-        new_order.created_ts = int(datetime.utcnow().timestamp() * 1000)
+        new_order.created_ts = _now_vn_ts()
         db.add(new_order)
         db.flush()
         
@@ -1226,7 +1237,7 @@ def update_order_api(order_id: int, data: CheckoutRequest, db: Session = Depends
         old_order.customer_name = c_name if c_name else "Khách lẻ"
         old_order.customer_id = customer.id if customer else None
         old_order.total_amount = total_new
-        now_dt = datetime.now()
+        now_dt = _now_vn()
         old_order.created_at = now_dt
         old_order.created_ts = int(now_dt.timestamp() * 1000)
 
@@ -1338,7 +1349,7 @@ def checkout_draft(data: CheckoutRequest, db: Session = Depends(get_db)):
             is_draft=1,
             status='pending'
         )
-        new_order.created_ts = int(datetime.utcnow().timestamp() * 1000)
+        new_order.created_ts = _now_vn_ts()
         db.add(new_order)
         db.flush()
 
@@ -1436,7 +1447,7 @@ def receive_order(order_id: int, data: ReceiveOrderRequest, db: Session = Depend
             raise HTTPException(status_code=400, detail='Picker không hợp lệ')
         order.status = 'assigned'
         order.assigned_picker_id = picker.id
-        order.assigned_at = datetime.now()
+        order.assigned_at = _now_vn()
         db.commit()
         return {'status': 'success', 'message': f'Đã nhận đơn #{order_id}'}
     except HTTPException:
@@ -1658,20 +1669,9 @@ def confirm_order(order_id: int, data: Optional[PickerConfirmRequest] = None, db
             if item.id not in picked_by_item_id:
                 picked_by_item_id[item.id] = int(item.quantity or 0)
 
-        # Check real-time stock for picked quantities
-        for item in order.items:
-            picked_qty = int(picked_by_item_id.get(item.id, 0))
-            if picked_qty <= 0 or not item.variant_id:
-                continue
-            var = db.query(Variant).filter(Variant.id == item.variant_id).first()
-            if not var or int(var.stock or 0) < picked_qty:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"SP {item.product_name} không đủ hàng thực tế ({int(var.stock or 0) if var else 0} tồn kho)"
-                )
-
         delivered_total = 0
         shortage_parts = []
+        stock_mismatch_parts = []
 
         # Apply stock and update order items to delivered qty
         for item in list(order.items):
@@ -1681,7 +1681,12 @@ def confirm_order(order_id: int, data: Optional[PickerConfirmRequest] = None, db
             if item.variant_id and picked_qty > 0:
                 var = db.query(Variant).filter(Variant.id == item.variant_id).first()
                 if var:
-                    var.stock -= picked_qty
+                    available = int(var.stock or 0)
+                    if picked_qty > available:
+                        stock_mismatch_parts.append(f"{item.product_name} (kho thiếu {picked_qty - available})")
+                        var.stock = 0
+                    else:
+                        var.stock -= picked_qty
 
             if picked_qty < requested_qty:
                 shortage_parts.append(f"{item.product_name} ({picked_qty}/{requested_qty})")
@@ -1701,8 +1706,9 @@ def confirm_order(order_id: int, data: Optional[PickerConfirmRequest] = None, db
         order.total_amount = delivered_total
         order.picker_note = ""
         shortage_note = ""
-        if shortage_parts:
-            shortage_note = "Thiếu hàng: " + "; ".join(shortage_parts)
+        combined_shortages = shortage_parts + stock_mismatch_parts
+        if combined_shortages:
+            shortage_note = "Thiếu hàng: " + "; ".join(combined_shortages)
 
         manual_note = (picker_note or "").strip()
         if shortage_note and manual_note:

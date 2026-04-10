@@ -2,7 +2,7 @@ import os
 import sys
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey, DateTime, Float
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 def get_db_path():
     if getattr(sys, 'frozen', False):
@@ -23,6 +23,17 @@ if not DATABASE_URL:
     DATABASE_URL = f"sqlite:///{db_path}"
 
 is_sqlite = DATABASE_URL.startswith("sqlite")
+
+VN_TZ = timezone(timedelta(hours=7))
+
+
+def _now_vn() -> datetime:
+    return datetime.now(VN_TZ).replace(tzinfo=None)
+
+
+def _now_vn_ts() -> int:
+    return int(datetime.now(VN_TZ).timestamp() * 1000)
+
 
 Base = declarative_base()
 connect_args = {"check_same_thread": False} if is_sqlite else {}
@@ -75,9 +86,9 @@ class DebtLog(Base):
     change_amount = Column(Integer) # Số tiền thay đổi (+ hoặc -)
     new_balance = Column(Integer) # Dư nợ sau khi đổi
     note = Column(String) # Lý do (vd: "Mua hàng đơn #10", "Trả nợ", "Điều chỉnh")
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, default=_now_vn)
     # high-resolution epoch milliseconds for stable sorting when many entries share the same minute
-    created_ts = Column(Integer, default=lambda: int(datetime.utcnow().timestamp() * 1000))
+    created_ts = Column(Integer, default=_now_vn_ts)
     
     customer = relationship("Customer", back_populates="logs")
 
@@ -87,9 +98,9 @@ class Order(Base):
     id = Column(Integer, primary_key=True, index=True)
     customer_name = Column(String) # Vẫn giữ để hiển thị nhanh
     customer_id = Column(Integer, ForeignKey("customers.id"), nullable=True) # Link vào hồ sơ khách
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, default=_now_vn)
     # high-resolution epoch milliseconds for stable sorting
-    created_ts = Column(Integer, default=lambda: int(datetime.utcnow().timestamp() * 1000))
+    created_ts = Column(Integer, default=_now_vn_ts)
     total_amount = Column(Integer)
     is_draft = Column(Integer, default=0)  # 1 = PENDING (chờ duyệt), 0 = APPROVED (đã apply)
     # status: 'pending' | 'accepted' | 'completed'
@@ -127,7 +138,7 @@ class Employee(Base):
     phone = Column(String, default="")
     role = Column(String, index=True)
     pin = Column(String, unique=True, index=True)
-    created_at = Column(DateTime, default=datetime.now)
+    created_at = Column(DateTime, default=_now_vn)
 
     assigned_orders = relationship("Order", foreign_keys=[Order.assigned_picker_id], back_populates="assigned_picker")
     delivered_orders = relationship("Order", foreign_keys=[Order.delivered_by_id], back_populates="delivered_by")

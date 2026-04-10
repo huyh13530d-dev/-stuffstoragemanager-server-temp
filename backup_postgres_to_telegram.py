@@ -3,7 +3,7 @@ import os
 import sys
 import tempfile
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import requests
 
@@ -70,7 +70,8 @@ def main() -> int:
     token = _get_bot_token()
     chat_id = _get_chat_id()
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    vn_tz = timezone(timedelta(hours=7))
+    stamp = datetime.now(vn_tz).strftime("%Y%m%d_%H%M%S")
     label = args.label.strip() or "backup"
     file_name = f"{label}_backup_{stamp}.dump"
 
@@ -78,7 +79,7 @@ def main() -> int:
         output_path = os.path.join(tmp, file_name)
         _run_pg_dump(db_url, output_path)
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
-        caption = f"DB backup {label} • {stamp} UTC • {size_mb:.2f} MB"
+        caption = f"DB backup {label} • {stamp} VN • {size_mb:.2f} MB"
         _send_to_telegram(token, chat_id, output_path, caption)
 
     print("Backup sent to Telegram successfully.")
