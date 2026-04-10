@@ -867,6 +867,38 @@ def create_customer_manual(data: CustomerCreate, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.delete("/orders/{order_id}/cancel")
+def cancel_order(order_id: int, db: Session = Depends(get_db)):
+    """
+    Staff cancels an order in pending/approved/assigned states.
+    The order is deleted and should disappear from picker queues.
+    """
+    try:
+        order = db.query(Order).filter(Order.id == order_id).first()
+        if not order:
+            raise HTTPException(status_code=404, detail="Hóa đơn không tồn tại")
+
+        if order.status not in ("pending", "approved", "assigned"):
+            raise HTTPException(status_code=400, detail="Chỉ hủy đơn ở trạng thái chờ duyệt/đã duyệt/đã nhận")
+
+        assigned_picker_id = order.assigned_picker_id
+        db.query(OrderItem).filter(OrderItem.order_id == order_id).delete()
+        db.delete(order)
+        db.commit()
+
+        return {
+            "status": "success",
+            "message": f"Đơn #{order_id} đã bị hủy",
+            "assigned_picker_id": assigned_picker_id,
+        }
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/checkout/desktop-dispatch")
 def checkout_desktop_dispatch(data: CheckoutRequest, db: Session = Depends(get_db)):
     """
