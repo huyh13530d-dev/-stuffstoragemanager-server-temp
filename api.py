@@ -120,6 +120,28 @@ def _save_product_image_file(photo: UploadFile) -> str:
     return f"/product-images/{safe_name}"
 
 
+def _parse_delivery_photo_paths(raw) -> list:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    if isinstance(raw, str):
+        t = raw.strip()
+        if not t:
+            return []
+        if t.startswith('['):
+            try:
+                data = json.loads(t)
+                if isinstance(data, list):
+                    return [str(x).strip() for x in data if str(x).strip()]
+            except Exception:
+                pass
+        if '|' in t:
+            return [p.strip() for p in t.split('|') if p.strip()]
+        return [t]
+    return [str(raw).strip()]
+
+
 def _normalize_picker_confirm_items(raw_items: list) -> List['PickerConfirmItem']:
     normalized = []
     for x in raw_items:
@@ -356,11 +378,19 @@ ensure_employee_schema_and_seed()
 ensure_order_flow_columns()
 
 
-def _send_photo_to_telegram(photo_path: str, caption: str) -> dict:
-    token = os.environ.get('TELEGRAM_BOT_TOKEN')
-    chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+def _get_telegram_config():
+    token = os.environ.get('TELEGRAM_DB_BOT_TOKEN') or os.environ.get('TELEGRAM_BOT_TOKEN')
+    chat_id = os.environ.get('TELEGRAM_DB_CHAT_ID') or os.environ.get('TELEGRAM_CHAT_ID')
     if not token or not chat_id:
+        return None
+    return token, chat_id
+
+
+def _send_photo_to_telegram(photo_path: str, caption: str) -> dict:
+    config = _get_telegram_config()
+    if not config:
         return {}
+    token, chat_id = config
     url = f"https://api.telegram.org/bot{token}/sendPhoto"
     try:
         with open(photo_path, 'rb') as f:
@@ -373,6 +403,50 @@ def _send_photo_to_telegram(photo_path: str, caption: str) -> dict:
     except Exception as e:
         print("Warning: telegram send failed:", e)
     return {}
+
+
+def _send_photos_to_telegram(photo_paths: list, caption: str) -> list:
+    config = _get_telegram_config()
+    if not config:
+        return []
+    token, chat_id = config
+    paths = [p for p in photo_paths if p]
+    if not paths:
+        return []
+    if len(paths) == 1:
+        result = _send_photo_to_telegram(paths[0], caption)
+        return [result] if result else []
+
+    url = f"https://api.telegram.org/bot{token}/sendMediaGroup"
+    files = {}
+    media = []
+    opened_files = []
+    try:
+        for i, path in enumerate(paths):
+            key = f'file{i}'
+            f = open(path, 'rb')
+            opened_files.append(f)
+            files[key] = f
+            payload = {'type': 'photo', 'media': f'attach://{key}'}
+            if i == 0 and caption:
+                payload['caption'] = caption
+            media.append(payload)
+
+        data = {'chat_id': chat_id, 'media': json.dumps(media, ensure_ascii=False)}
+        r = requests.post(url, files=files, data=data, timeout=60)
+        if r.status_code == 200:
+            result = r.json().get('result')
+            return result if isinstance(result, list) else []
+        print("Warning: telegram sendMediaGroup failed:", r.status_code, r.text)
+    except Exception as e:
+        print("Warning: telegram sendMediaGroup failed:", e)
+    finally:
+        for f in opened_files:
+            try:
+                f.close()
+            except Exception:
+                pass
+    return []
 
 
 def _send_product_image_to_telegram(photo_path: str, caption: str) -> None:
@@ -433,6 +507,7 @@ def _serialize_order(o: Order):
                 "current_stock": None,
                 "enough_stock": True,
             })
+    delivery_paths = _parse_delivery_photo_paths(o.delivery_photo_path)
     return {
         "id": o.id,
         "created_at": o.created_at.strftime("%Y-%m-%d %H:%M") if o.created_at else "",
@@ -449,6 +524,7 @@ def _serialize_order(o: Order):
         "delivered_by_name": (o.delivered_by.name if o.delivered_by else ""),
         "delivered_at": o.delivered_at.strftime("%Y-%m-%d %H:%M") if o.delivered_at else "",
         "delivery_photo_path": (o.delivery_photo_path or ""),
+        "delivery_photo_paths": delivery_paths,
         "items": items_list,
     }
 
@@ -544,23 +620,25 @@ class DeliverOrderRequest(BaseModel):
     picker_note: str = ""
 
 
-def _deliver_order_internal(order_id: int, picker_id: int, photo_path: str, items: List[PickerConfirmItem], db: Session, picker_note: str = ""):
-    normalized_photo_path = photo_path.strip()
-    if not normalized_photo_path:
+def _deliver_order_internal(order_id: int, picker_id: int, photo_paths, items: List[PickerConfirmItem], db: Session, picker_note: str = ""):
+    normalized_paths = _parse_delivery_photo_paths(photo_paths)
+    if not normalized_paths:
         raise HTTPException(status_code=400, detail='Bắt buộc chụp ảnh xác nhận giao hàng')
 
-    abs_photo_path = None
-    if normalized_photo_path.startswith('/delivery-proofs/'):
-        file_name = os.path.basename(normalized_photo_path)
-        abs_path = os.path.join(_delivery_upload_dir, file_name)
-        if not os.path.exists(abs_path):
-            raise HTTPException(status_code=400, detail='Ảnh xác nhận không tồn tại trên server, vui lòng chụp và gửi lại')
-        normalized_photo_path = f'/delivery-proofs/{file_name}'
-        abs_photo_path = abs_path
-    elif normalized_photo_path.startswith('http://') or normalized_photo_path.startswith('https://'):
-        pass
-    else:
-        raise HTTPException(status_code=400, detail='Ứng dụng mobile cũ chưa hỗ trợ upload ảnh. Vui lòng cập nhật app mobile mới nhất')
+    abs_photo_paths = []
+    normalized_photo_paths = []
+    for raw_path in normalized_paths:
+        if raw_path.startswith('/delivery-proofs/'):
+            file_name = os.path.basename(raw_path)
+            abs_path = os.path.join(_delivery_upload_dir, file_name)
+            if not os.path.exists(abs_path):
+                raise HTTPException(status_code=400, detail='Ảnh xác nhận không tồn tại trên server, vui lòng chụp và gửi lại')
+            normalized_photo_paths.append(f'/delivery-proofs/{file_name}')
+            abs_photo_paths.append(abs_path)
+        elif raw_path.startswith('http://') or raw_path.startswith('https://'):
+            normalized_photo_paths.append(raw_path)
+        else:
+            raise HTTPException(status_code=400, detail='Ứng dụng mobile cũ chưa hỗ trợ upload ảnh. Vui lòng cập nhật app mobile mới nhất')
 
     picker = db.query(Employee).filter(Employee.id == picker_id).first()
     if not picker or picker.role != 'picker':
@@ -578,10 +656,13 @@ def _deliver_order_internal(order_id: int, picker_id: int, photo_path: str, item
     confirm_result = confirm_order(order_id, proxy if items else None, db, picker_note=picker_note)
     order.delivered_by_id = picker.id
     order.delivered_at = _now_vn()
-    order.delivery_photo_path = normalized_photo_path
+    if len(normalized_photo_paths) > 1:
+        order.delivery_photo_path = json.dumps(normalized_photo_paths, ensure_ascii=False)
+    else:
+        order.delivery_photo_path = normalized_photo_paths[0] if normalized_photo_paths else ''
     db.commit()
 
-    if abs_photo_path:
+    if abs_photo_paths:
         try:
             caption_parts = [
                 f"Đơn #{order.id} • {order.customer_name or 'Khách lẻ'}",
@@ -591,13 +672,15 @@ def _deliver_order_internal(order_id: int, picker_id: int, photo_path: str, item
             if order.picker_note:
                 caption_parts.append(f"Ghi chú: {order.picker_note}")
             caption = "\n".join([p for p in caption_parts if p])
-            telegram_result = _send_photo_to_telegram(abs_photo_path, caption)
-            if telegram_result:
+            telegram_results = _send_photos_to_telegram(abs_photo_paths, caption)
+            for telegram_result in telegram_results:
+                if not telegram_result:
+                    continue
                 photos = telegram_result.get('photo') or []
                 if photos:
                     order.telegram_file_id = photos[-1].get('file_id', '') or ''
                 order.telegram_message_id = str(telegram_result.get('message_id') or '')
-                db.commit()
+            db.commit()
         except Exception as e:
             print("Warning: telegram backup failed:", e)
     return confirm_result
@@ -1513,7 +1596,7 @@ def get_assigned_orders(picker_id: int, db: Session = Depends(get_db)):
 
 @app.put('/orders/{order_id}/deliver')
 def deliver_order(order_id: int, data: DeliverOrderRequest, db: Session = Depends(get_db)):
-    return _deliver_order_internal(order_id, data.picker_id, data.photo_path, data.items, db, picker_note=data.picker_note)
+    return _deliver_order_internal(order_id, data.picker_id, [data.photo_path], data.items, db, picker_note=data.picker_note)
 
 
 @app.put('/orders/{order_id}/deliver-with-photo')
@@ -1522,7 +1605,8 @@ async def deliver_order_with_photo(
     picker_id: int = Form(...),
     items_json: str = Form('[]'),
     picker_note: str = Form(''),
-    photo: UploadFile = File(...),
+    photo: Optional[UploadFile] = File(None),
+    photos: Optional[List[UploadFile]] = File(None),
     db: Session = Depends(get_db),
 ):
     try:
@@ -1533,8 +1617,16 @@ async def deliver_order_with_photo(
         raise HTTPException(status_code=400, detail='Dữ liệu items không hợp lệ')
 
     normalized_items = _normalize_picker_confirm_items(raw_items)
-    photo_path = _save_delivery_photo_file(order_id, photo)
-    return _deliver_order_internal(order_id, picker_id, photo_path, normalized_items, db, picker_note=picker_note)
+    upload_files = []
+    if photos:
+        upload_files = [p for p in photos if p is not None]
+    elif photo is not None:
+        upload_files = [photo]
+    if not upload_files:
+        raise HTTPException(status_code=400, detail='Thiếu ảnh xác nhận giao hàng')
+
+    photo_paths = [_save_delivery_photo_file(order_id, f) for f in upload_files]
+    return _deliver_order_internal(order_id, picker_id, photo_paths, normalized_items, db, picker_note=picker_note)
 
 
 @app.get('/delivery-proofs/pending')
@@ -1550,15 +1642,25 @@ def list_pending_delivery_proofs(since_order_id: int = 0, limit: int = 200, db: 
     orders = q.all()
     data = []
     for o in orders:
-        rel = (o.delivery_photo_path or '').strip()
+        rels = _parse_delivery_photo_paths(o.delivery_photo_path)
+        rel = (rels[0] if rels else '').strip()
         file_name = os.path.basename(rel)
+        download_urls = []
+        file_names = []
+        for r in rels:
+            name = os.path.basename(r)
+            file_names.append(name)
+            download_urls.append(r if r.startswith('/delivery-proofs/') else f'/delivery-proofs/{name}')
         data.append({
             'order_id': o.id,
             'delivered_at': o.delivered_at.strftime('%Y-%m-%d %H:%M') if o.delivered_at else '',
             'customer_name': o.customer_name or 'Khách lẻ',
             'photo_path': rel,
+            'photo_paths': rels,
             'file_name': file_name,
+            'file_names': file_names,
             'download_url': rel if rel.startswith('/delivery-proofs/') else f'/delivery-proofs/{file_name}',
+            'download_urls': download_urls,
         })
     return {'data': data, 'count': len(data)}
 

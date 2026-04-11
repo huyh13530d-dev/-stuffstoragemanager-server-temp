@@ -64,35 +64,45 @@ def main():
         order_id = int(row.get('order_id') or 0)
         file_name = str(row.get('file_name') or '').strip()
         download_url = str(row.get('download_url') or '').strip()
-        if order_id <= 0 or not file_name or not download_url:
+        download_urls = [str(x).strip() for x in (row.get('download_urls') or []) if str(x).strip()]
+        file_names = [str(x).strip() for x in (row.get('file_names') or []) if str(x).strip()]
+        if order_id <= 0 or (not download_urls and (not file_name or not download_url)):
             continue
 
         if order_id > max_seen:
             max_seen = order_id
 
-        target_name = f"order_{order_id}_{file_name}"
-        target_path = out_dir / target_name
-        if target_path.exists() and target_path.stat().st_size > 0:
-            continue
+        urls_to_fetch = download_urls if download_urls else [download_url]
+        names_to_use = file_names if file_names else [file_name]
 
-        if download_url.startswith('http://') or download_url.startswith('https://'):
-            photo_url = download_url
-        else:
-            photo_url = f"{api_base}{download_url}"
-
-        try:
-            r = requests.get(photo_url, timeout=60)
-            r.raise_for_status()
-            target_path.write_bytes(r.content)
-            downloaded += 1
-            print(f"Đã tải: #{order_id} -> {target_path.name}")
-        except HTTPError as e:
-            status = e.response.status_code if e.response is not None else None
-            if status == 404:
-                missing += 1
-                print(f"Bỏ qua #{order_id}: ảnh không còn trên server ({photo_url})")
+        for i, url in enumerate(urls_to_fetch):
+            name = names_to_use[i] if i < len(names_to_use) and names_to_use[i] else file_name
+            if not url or not name:
                 continue
-            raise
+
+            target_name = f"order_{order_id}_{name}"
+            target_path = out_dir / target_name
+            if target_path.exists() and target_path.stat().st_size > 0:
+                continue
+
+            if url.startswith('http://') or url.startswith('https://'):
+                photo_url = url
+            else:
+                photo_url = f"{api_base}{url}"
+
+            try:
+                r = requests.get(photo_url, timeout=60)
+                r.raise_for_status()
+                target_path.write_bytes(r.content)
+                downloaded += 1
+                print(f"Đã tải: #{order_id} -> {target_path.name}")
+            except HTTPError as e:
+                status = e.response.status_code if e.response is not None else None
+                if status == 404:
+                    missing += 1
+                    print(f"Bỏ qua #{order_id}: ảnh không còn trên server ({photo_url})")
+                    continue
+                raise
 
     save_state(state_path, max_seen)
     print(f"Hoàn tất. Tải mới: {downloaded}, thiếu trên server: {missing}, last_order_id={max_seen}")
