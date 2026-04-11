@@ -9,6 +9,7 @@ import os
 import uuid
 import json
 import requests
+import threading
 try:
     from backend import database as _db
 except ModuleNotFoundError:
@@ -74,6 +75,11 @@ class DebtLogUpdate(BaseModel):
 
 class OrderDateUpdate(BaseModel):
     created_at: str  # YYYY-MM-DD HH:MM
+
+
+class DeliveryProofAckRequest(BaseModel):
+    order_id: int
+    local_file_names: List[str] = []
 
 app = FastAPI()
 
@@ -499,8 +505,20 @@ def _send_photos_to_telegram(photo_paths: list, caption: str) -> list:
             result = r.json().get('result')
             return result if isinstance(result, list) else []
         print("Warning: telegram sendMediaGroup failed:", r.status_code, r.text)
+        fallback_results = []
+        for i, p in enumerate(paths):
+            msg = _send_photo_to_telegram(p, caption if i == 0 else '')
+            if msg:
+                fallback_results.append(msg)
+        return fallback_results
     except Exception as e:
         print("Warning: telegram sendMediaGroup failed:", e)
+        fallback_results = []
+        for i, p in enumerate(paths):
+            msg = _send_photo_to_telegram(p, caption if i == 0 else '')
+            if msg:
+                fallback_results.append(msg)
+        return fallback_results
     finally:
         for f in opened_files:
             try:
@@ -534,6 +552,43 @@ def _send_product_image_to_telegram(photo_path: str, caption: str) -> None:
     except Exception as e:
         print("Warning: telegram send failed:", e)
     return {}
+
+
+def _order_status_label_vi(status: str) -> str:
+    s = (status or '').strip().lower()
+    if s == 'pending':
+        return 'Đợi duyệt'
+    if s == 'approved':
+        return 'Đã duyệt'
+    if s in ('assigned', 'accepted'):
+        return 'Đã nhận'
+    if s == 'completed':
+        return 'Hoàn thành'
+    return (status or '').upper()
+
+
+def _send_delivery_backup_async(order_id: int, abs_photo_paths: list, caption: str):
+    try:
+        telegram_results = _send_photos_to_telegram(abs_photo_paths, caption)
+        if not telegram_results:
+            return
+        db = SessionLocal()
+        try:
+            order = db.query(Order).filter(Order.id == order_id).first()
+            if not order:
+                return
+            for telegram_result in telegram_results:
+                if not telegram_result:
+                    continue
+                photos = telegram_result.get('photo') or []
+                if photos:
+                    order.telegram_file_id = photos[-1].get('file_id', '') or ''
+                order.telegram_message_id = str(telegram_result.get('message_id') or '')
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        print('Warning: telegram backup failed:', e)
 
 def _get_default_area_id(db: Session):
     area = db.query(Area).filter(Area.name == "Chợ hàn").first()
@@ -769,26 +824,19 @@ def _deliver_order_internal(order_id: int, picker_id: int, photo_paths, items: L
     db.commit()
 
     if abs_photo_paths:
-        try:
-            caption_parts = [
-                f"Đơn #{order.id} • {order.customer_name or 'Khách lẻ'}",
-                f"Picker: {picker.name}",
-                order.delivered_at.strftime('%Y-%m-%d %H:%M') if order.delivered_at else '',
-            ]
-            if order.picker_note:
-                caption_parts.append(f"Ghi chú: {order.picker_note}")
-            caption = "\n".join([p for p in caption_parts if p])
-            telegram_results = _send_photos_to_telegram(abs_photo_paths, caption)
-            for telegram_result in telegram_results:
-                if not telegram_result:
-                    continue
-                photos = telegram_result.get('photo') or []
-                if photos:
-                    order.telegram_file_id = photos[-1].get('file_id', '') or ''
-                order.telegram_message_id = str(telegram_result.get('message_id') or '')
-            db.commit()
-        except Exception as e:
-            print("Warning: telegram backup failed:", e)
+        caption_parts = [
+            f"Đơn #{order.id} • {order.customer_name or 'Khách lẻ'}",
+            f"Picker: {picker.name}",
+            order.delivered_at.strftime('%Y-%m-%d %H:%M') if order.delivered_at else '',
+        ]
+        if order.picker_note:
+            caption_parts.append(f"Ghi chú: {order.picker_note}")
+        caption = "\n".join([p for p in caption_parts if p])
+        threading.Thread(
+            target=_send_delivery_backup_async,
+            args=(order.id, abs_photo_paths, caption),
+            daemon=True,
+        ).start()
     return confirm_result
 
 # --- API NHÂN VIÊN / PHÂN QUYỀN ---
@@ -949,7 +997,7 @@ def get_employee_activities(emp_id: int, q: str = '', days: int = 0, limit: int 
             'sort_ts': ts,
             'date': o.created_at.strftime('%Y-%m-%d %H:%M') if o.created_at else '',
             'title': f"Đơn #{o.id} • {o.customer_name or 'Khách lẻ'}",
-            'subtitle': f"{o.status.upper()} • SL {sum((i.quantity or 0) for i in (o.items or []))}",
+            'subtitle': f"{_order_status_label_vi(o.status)} • SL {sum((i.quantity or 0) for i in (o.items or []))}",
             'amount': int(o.total_amount or 0),
             'order': _serialize_order(o),
         })
@@ -1377,6 +1425,8 @@ def get_customer_history(cid: int, db: Session = Depends(get_db)):
                 "date": o.created_at.strftime("%d/%m %H:%M"),
                 "total_money": o.total_amount,
                 "total_qty": sum(i.quantity for i in o.items),
+                "delivery_photo_path": (o.delivery_photo_path or ""),
+                "delivery_photo_paths": _parse_delivery_photo_paths(o.delivery_photo_path),
                 "items": items_detail # Danh sách item đầy đủ ID
             }
         })
@@ -1782,6 +1832,8 @@ def get_pending_orders(db: Session = Depends(get_db)):
                 "total_qty": calc_qty,
                 "status": o.status,
                 "picker_note": (o.picker_note or ""),
+                "created_by_employee_id": o.created_by_employee_id,
+                "created_by_employee_name": (o.created_by_employee.name if o.created_by_employee else ""),
                 "has_stock_conflict": has_stock_conflict,
                 "items": items_list
             })
@@ -1883,6 +1935,9 @@ def list_pending_delivery_proofs(since_order_id: int = 0, limit: int = 200, db: 
     data = []
     for o in orders:
         rels = _parse_delivery_photo_paths(o.delivery_photo_path)
+        rels = [r for r in rels if r and not r.startswith('local://')]
+        if not rels:
+            continue
         rel = (rels[0] if rels else '').strip()
         file_name = os.path.basename(rel)
         download_urls = []
@@ -1903,6 +1958,48 @@ def list_pending_delivery_proofs(since_order_id: int = 0, limit: int = 200, db: 
             'download_urls': download_urls,
         })
     return {'data': data, 'count': len(data)}
+
+
+@app.post('/delivery-proofs/ack-local')
+def ack_delivery_proof_local(data: DeliveryProofAckRequest, db: Session = Depends(get_db)):
+    order = db.query(Order).filter(Order.id == data.order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail='Đơn hàng không tồn tại')
+
+    current_paths = _parse_delivery_photo_paths(order.delivery_photo_path)
+    if not current_paths:
+        return {'status': 'noop', 'message': 'Không có path ảnh để đồng bộ'}
+
+    local_names = [os.path.basename(str(x).strip()) for x in (data.local_file_names or []) if str(x).strip()]
+    if not local_names:
+        local_names = [os.path.basename(p) for p in current_paths if str(p).strip()]
+
+    local_paths = [f'local://delivery_proofs/{name}' for name in local_names if name]
+    if local_paths:
+        order.delivery_photo_path = json.dumps(local_paths, ensure_ascii=False) if len(local_paths) > 1 else local_paths[0]
+
+    removed = 0
+    for p in current_paths:
+        raw = str(p).strip()
+        if not raw or raw.startswith('local://'):
+            continue
+        if raw.startswith('http://') or raw.startswith('https://'):
+            continue
+        abs_path = os.path.join(_delivery_upload_dir, os.path.basename(raw))
+        if os.path.exists(abs_path):
+            try:
+                os.remove(abs_path)
+                removed += 1
+            except Exception:
+                pass
+
+    db.commit()
+    return {
+        'status': 'ok',
+        'order_id': order.id,
+        'removed_remote_files': removed,
+        'local_paths': local_paths,
+    }
 
 
 @app.get('/delivery-proofs/{file_name}')

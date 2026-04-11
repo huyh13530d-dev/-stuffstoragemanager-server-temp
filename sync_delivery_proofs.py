@@ -57,6 +57,7 @@ def main():
     max_seen = last_order_id
     downloaded = 0
     missing = 0
+    synced_by_order = {}
 
     for row in rows:
         if not isinstance(row, dict):
@@ -81,6 +82,7 @@ def main():
                 continue
 
             target_name = f"order_{order_id}_{name}"
+            synced_by_order.setdefault(order_id, set()).add(target_name)
             target_path = out_dir / target_name
             if target_path.exists() and target_path.stat().st_size > 0:
                 continue
@@ -103,6 +105,30 @@ def main():
                     print(f"Bỏ qua #{order_id}: ảnh không còn trên server ({photo_url})")
                     continue
                 raise
+
+    ack_url = f"{api_base}/delivery-proofs/ack-local"
+    for order_id, names in synced_by_order.items():
+        if not names:
+            continue
+        has_all = True
+        for name in names:
+            f = out_dir / f"order_{order_id}_{name}"
+            if (not f.exists()) or f.stat().st_size <= 0:
+                has_all = False
+                break
+        if not has_all:
+            continue
+
+        try:
+            ack_resp = requests.post(
+                ack_url,
+                json={'order_id': int(order_id), 'local_file_names': sorted(names)},
+                timeout=30,
+            )
+            if ack_resp.status_code not in (200, 404):
+                print(f"Ack local proof thất bại #{order_id}: {ack_resp.status_code} {ack_resp.text}")
+        except Exception as e:
+            print(f"Ack local proof lỗi #{order_id}: {e}")
 
     save_state(state_path, max_seen)
     print(f"Hoàn tất. Tải mới: {downloaded}, thiếu trên server: {missing}, last_order_id={max_seen}")
