@@ -83,6 +83,7 @@ class DebtLog(Base):
     __tablename__ = "debt_logs"
     id = Column(Integer, primary_key=True, index=True)
     customer_id = Column(Integer, ForeignKey("customers.id"))
+    actor_employee_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
     change_amount = Column(Integer) # Số tiền thay đổi (+ hoặc -)
     new_balance = Column(Integer) # Dư nợ sau khi đổi
     note = Column(String) # Lý do (vd: "Mua hàng đơn #10", "Trả nợ", "Điều chỉnh")
@@ -106,6 +107,7 @@ class Order(Base):
     # status: 'pending' | 'accepted' | 'completed'
     status = Column(String, default='completed')
     picker_note = Column(String, default="")
+    created_by_employee_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
     assigned_picker_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
     assigned_at = Column(DateTime, nullable=True)
     delivered_by_id = Column(Integer, ForeignKey("employees.id"), nullable=True)
@@ -116,6 +118,7 @@ class Order(Base):
 
     items = relationship("OrderItem", back_populates="order")
     customer_rel = relationship("Customer", back_populates="orders")
+    created_by_employee = relationship("Employee", foreign_keys=[created_by_employee_id], back_populates="created_orders")
     assigned_picker = relationship("Employee", foreign_keys=[assigned_picker_id], back_populates="assigned_orders")
     delivered_by = relationship("Employee", foreign_keys=[delivered_by_id], back_populates="delivered_orders")
 
@@ -144,5 +147,6 @@ class Employee(Base):
     is_active = Column(Integer, default=1)
     created_at = Column(DateTime, default=_now_vn)
 
+    created_orders = relationship("Order", foreign_keys=[Order.created_by_employee_id], back_populates="created_by_employee")
     assigned_orders = relationship("Order", foreign_keys=[Order.assigned_picker_id], back_populates="assigned_picker")
     delivered_orders = relationship("Order", foreign_keys=[Order.delivered_by_id], back_populates="delivered_by")

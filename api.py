@@ -37,6 +37,14 @@ def _now_vn_ts() -> int:
     return int(datetime.now(VN_TZ).timestamp() * 1000)
 
 
+def _period_start_vn(days: int) -> Optional[datetime]:
+    if days <= 0:
+        return None
+    now = _now_vn()
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return day_start - timedelta(days=max(0, days - 1))
+
+
 if Employee is None:
     class Employee(Base):
         __tablename__ = "employees"
@@ -57,6 +65,7 @@ class DebtLogCreate(BaseModel):
     change_amount: int
     note: str = ""
     created_at: Optional[str] = None  # format: YYYY-MM-DD HH:MM
+    actor_employee_id: Optional[int] = None
 
 class DebtLogUpdate(BaseModel):
     change_amount: int
@@ -380,6 +389,7 @@ def ensure_employee_schema_and_seed():
 
 def ensure_order_flow_columns():
     cols = {
+        'created_by_employee_id': 'INTEGER',
         'assigned_picker_id': 'INTEGER',
         'assigned_at': 'TIMESTAMP',
         'delivered_by_id': 'INTEGER',
@@ -404,12 +414,29 @@ def ensure_order_flow_columns():
     except Exception as e:
         print("Warning: ensure_order_flow_columns failed:", e)
 
+
+def ensure_activity_tracking_columns():
+    try:
+        with engine.connect() as conn:
+            if is_sqlite:
+                info = conn.execute(text("PRAGMA table_info('debt_logs')")).fetchall()
+                existing = [r[1] for r in info]
+                if 'actor_employee_id' not in existing:
+                    conn.execute(text("ALTER TABLE debt_logs ADD COLUMN actor_employee_id INTEGER"))
+                conn.commit()
+            else:
+                conn.execute(text("ALTER TABLE debt_logs ADD COLUMN IF NOT EXISTS actor_employee_id INTEGER"))
+                conn.commit()
+    except Exception as e:
+        print("Warning: ensure_activity_tracking_columns failed:", e)
+
 ensure_status_column()
 ensure_picker_note_column()
 ensure_telegram_columns()
 ensure_area_schema_and_seed()
 ensure_employee_schema_and_seed()
 ensure_order_flow_columns()
+ensure_activity_tracking_columns()
 
 
 def _get_telegram_config():
@@ -584,6 +611,8 @@ def _serialize_order(o: Order):
         "total_qty": calc_qty,
         "status": o.status,
         "picker_note": (o.picker_note or ""),
+        "created_by_employee_id": o.created_by_employee_id,
+        "created_by_employee_name": (o.created_by_employee.name if getattr(o, 'created_by_employee', None) else ""),
         "assigned_picker_id": o.assigned_picker_id,
         "assigned_picker_name": (o.assigned_picker.name if o.assigned_picker else ""),
         "assigned_at": o.assigned_at.strftime("%Y-%m-%d %H:%M") if o.assigned_at else "",
@@ -647,6 +676,7 @@ class CartItem(BaseModel):
 class CheckoutRequest(BaseModel):
     customer_name: str
     customer_phone: str = ""
+    employee_id: Optional[int] = None
     cart: List[CartItem]
 
 class PickerConfirmItem(BaseModel):
@@ -866,15 +896,87 @@ def get_employee_deliveries(emp_id: int, q: str = '', days: int = 0, limit: int 
         else:
             query = query.filter(Order.customer_name.ilike(f"%{keyword}%"))
 
-    if days > 0:
-        min_dt = _now_vn() - timedelta(days=days)
-        query = query.filter(Order.delivered_at.isnot(None), Order.delivered_at >= min_dt)
+    period_start = _period_start_vn(days)
+    if period_start is not None:
+        query = query.filter(Order.delivered_at.isnot(None), Order.delivered_at >= period_start)
 
     orders = query.order_by(desc(Order.delivered_at), desc(Order.id)).limit(lim).all()
     return {
         'employee': _serialize_employee(emp),
         'data': [_serialize_order(o) for o in orders],
         'count': len(orders),
+    }
+
+
+@app.get('/employees/{emp_id}/activities')
+def get_employee_activities(emp_id: int, q: str = '', days: int = 0, limit: int = 300, db: Session = Depends(get_db)):
+    emp = db.query(Employee).filter(Employee.id == emp_id).first()
+    if not emp:
+        raise HTTPException(status_code=404, detail='Nhân viên không tồn tại')
+
+    lim = 300 if limit <= 0 else min(limit, 1000)
+    period_start = _period_start_vn(days)
+    keyword = q.strip().lower()
+
+    order_query = db.query(Order).filter(Order.created_by_employee_id == emp_id)
+    if period_start is not None:
+        order_query = order_query.filter(Order.created_at >= period_start)
+    if keyword:
+        if keyword.isdigit():
+            order_query = order_query.filter((Order.id == int(keyword)) | (Order.customer_name.ilike(f"%{keyword}%")))
+        else:
+            order_query = order_query.filter(Order.customer_name.ilike(f"%{keyword}%"))
+    orders = order_query.order_by(desc(Order.created_ts), desc(Order.id)).limit(lim).all()
+
+    log_query = db.query(DebtLog, Customer.name).outerjoin(Customer, Customer.id == DebtLog.customer_id).filter(DebtLog.actor_employee_id == emp_id)
+    if period_start is not None:
+        log_query = log_query.filter(DebtLog.created_at >= period_start)
+    if keyword:
+        if keyword.isdigit():
+            log_query = log_query.filter((DebtLog.id == int(keyword)) | (Customer.name.ilike(f"%{keyword}%")) | (DebtLog.note.ilike(f"%{keyword}%")))
+        else:
+            log_query = log_query.filter((Customer.name.ilike(f"%{keyword}%")) | (DebtLog.note.ilike(f"%{keyword}%")))
+    logs = log_query.order_by(desc(DebtLog.created_ts), desc(DebtLog.id)).limit(lim).all()
+
+    activities = []
+    for o in orders:
+        ts = int(o.created_ts or 0)
+        if ts <= 0 and o.created_at:
+            ts = int(o.created_at.timestamp() * 1000)
+        activities.append({
+            'type': 'ORDER',
+            'sort_ts': ts,
+            'date': o.created_at.strftime('%Y-%m-%d %H:%M') if o.created_at else '',
+            'title': f"Đơn #{o.id} • {o.customer_name or 'Khách lẻ'}",
+            'subtitle': f"{o.status.upper()} • SL {sum((i.quantity or 0) for i in (o.items or []))}",
+            'amount': int(o.total_amount or 0),
+            'order': _serialize_order(o),
+        })
+
+    for row in logs:
+        log, customer_name = row
+        ts = int(log.created_ts or 0)
+        if ts <= 0 and log.created_at:
+            ts = int(log.created_at.timestamp() * 1000)
+        change = int(log.change_amount or 0)
+        is_collect = change < 0
+        activities.append({
+            'type': 'DEBT_LOG',
+            'sort_ts': ts,
+            'date': log.created_at.strftime('%Y-%m-%d %H:%M') if log.created_at else '',
+            'title': ('Thu tiền' if is_collect else 'Điều chỉnh công nợ') + f" • {customer_name or 'Khách'}",
+            'subtitle': (log.note or '').strip(),
+            'amount': change,
+            'log_id': log.id,
+            'customer_id': log.customer_id,
+        })
+
+    activities.sort(key=lambda x: int(x.get('sort_ts') or 0), reverse=True)
+    activities = activities[:lim]
+    return {
+        'employee': _serialize_employee(emp),
+        'data': activities,
+        'count': len(activities),
     }
 
 # --- API SẢN PHẨM ---
@@ -1302,6 +1404,11 @@ def create_debt_log(cid: int, data: DebtLogCreate, db: Session = Depends(get_db)
     try:
         amt = data.change_amount
         now = _now_vn()
+        actor_id = data.actor_employee_id
+        if actor_id is not None:
+            actor = db.query(Employee).filter(Employee.id == actor_id).first()
+            if not actor:
+                raise HTTPException(status_code=400, detail="Nhân viên thực hiện không tồn tại")
 
         display_dt = now
         if data.created_at:
@@ -1316,6 +1423,7 @@ def create_debt_log(cid: int, data: DebtLogCreate, db: Session = Depends(get_db)
         
         db.add(DebtLog(
             customer_id=cust.id, 
+            actor_employee_id=actor_id,
             change_amount=amt, 
             new_balance=cust.debt, 
             note=data.note, 
@@ -1423,7 +1531,8 @@ def checkout(data: CheckoutRequest, db: Session = Depends(get_db)):
             customer_name=customer.name if customer else "Khách lẻ",
             customer_id=customer.id if customer else None,
             is_draft=0,
-            status='completed'
+            status='completed',
+            created_by_employee_id=data.employee_id,
         )
         # set high-resolution timestamp
         new_order.created_ts = _now_vn_ts()
@@ -1602,7 +1711,8 @@ def checkout_draft(data: CheckoutRequest, db: Session = Depends(get_db)):
             customer_name=customer.name if customer else "Khách lẻ",
             customer_id=customer.id if customer else None,
             is_draft=1,
-            status='pending'
+            status='pending',
+            created_by_employee_id=data.employee_id,
         )
         new_order.created_ts = _now_vn_ts()
         db.add(new_order)
