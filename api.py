@@ -746,7 +746,8 @@ def _deliver_order_internal(order_id: int, picker_id: int, photo_paths, items: L
             raise HTTPException(status_code=400, detail='Ứng dụng mobile cũ chưa hỗ trợ upload ảnh. Vui lòng cập nhật app mobile mới nhất')
 
     picker = db.query(Employee).filter(Employee.id == picker_id).first()
-    if not picker or picker.role != 'picker':
+    picker_role = (picker.role.strip().lower() if picker and picker.role else '')
+    if not picker or picker_role not in ('picker', 'manager'):
         raise HTTPException(status_code=400, detail='Picker không hợp lệ')
 
     order = db.query(Order).filter(Order.id == order_id).first()
@@ -1808,7 +1809,8 @@ def receive_order(order_id: int, data: ReceiveOrderRequest, db: Session = Depend
         if order.status != 'approved':
             raise HTTPException(status_code=400, detail='Chỉ nhận đơn ở trạng thái đã duyệt')
         picker = db.query(Employee).filter(Employee.id == data.picker_id).first()
-        if not picker or picker.role != 'picker':
+        picker_role = (picker.role.strip().lower() if picker and picker.role else '')
+        if not picker or picker_role not in ('picker', 'manager'):
             raise HTTPException(status_code=400, detail='Picker không hợp lệ')
         order.status = 'assigned'
         order.assigned_picker_id = picker.id
