@@ -43,8 +43,12 @@ if Employee is None:
         id = Column(Integer, primary_key=True, index=True)
         name = Column(String, index=True)
         phone = Column(String, default="")
+        email = Column(String, default="")
+        address = Column(String, default="")
+        notes = Column(String, default="")
         role = Column(String, index=True)
         pin = Column(String, unique=True, index=True)
+        is_active = Column(Integer, default=1)
         created_at = Column(DateTime, default=_now_vn)
 from sqlalchemy import text
 
@@ -316,11 +320,29 @@ def ensure_employee_schema_and_seed():
                         id INTEGER PRIMARY KEY,
                         name VARCHAR,
                         phone VARCHAR,
+                        email VARCHAR DEFAULT '',
+                        address VARCHAR DEFAULT '',
+                        notes VARCHAR DEFAULT '',
                         role VARCHAR,
                         pin VARCHAR UNIQUE,
+                        is_active INTEGER DEFAULT 1,
                         created_at DATETIME
                     )
                 """))
+                info = conn.execute(text("PRAGMA table_info('employees')")).fetchall()
+                existing = [r[1] for r in info]
+                if 'email' not in existing:
+                    conn.execute(text("ALTER TABLE employees ADD COLUMN email VARCHAR DEFAULT ''"))
+                if 'address' not in existing:
+                    conn.execute(text("ALTER TABLE employees ADD COLUMN address VARCHAR DEFAULT ''"))
+                if 'notes' not in existing:
+                    conn.execute(text("ALTER TABLE employees ADD COLUMN notes VARCHAR DEFAULT ''"))
+                if 'is_active' not in existing:
+                    conn.execute(text("ALTER TABLE employees ADD COLUMN is_active INTEGER DEFAULT 1"))
+                conn.execute(text("UPDATE employees SET email = '' WHERE email IS NULL"))
+                conn.execute(text("UPDATE employees SET address = '' WHERE address IS NULL"))
+                conn.execute(text("UPDATE employees SET notes = '' WHERE notes IS NULL"))
+                conn.execute(text("UPDATE employees SET is_active = 1 WHERE is_active IS NULL"))
                 conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_employees_pin ON employees(pin)"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS ix_employees_role ON employees(role)"))
                 conn.execute(text("INSERT OR IGNORE INTO employees (name, phone, role, pin, created_at) VALUES ('Orderer mặc định', '', 'orderer', '0000', CURRENT_TIMESTAMP)"))
@@ -332,11 +354,23 @@ def ensure_employee_schema_and_seed():
                         id SERIAL PRIMARY KEY,
                         name VARCHAR,
                         phone VARCHAR,
+                        email VARCHAR DEFAULT '',
+                        address VARCHAR DEFAULT '',
+                        notes VARCHAR DEFAULT '',
                         role VARCHAR,
                         pin VARCHAR UNIQUE,
+                        is_active INTEGER DEFAULT 1,
                         created_at TIMESTAMP DEFAULT NOW()
                     )
                 """))
+                conn.execute(text("ALTER TABLE employees ADD COLUMN IF NOT EXISTS email VARCHAR DEFAULT ''"))
+                conn.execute(text("ALTER TABLE employees ADD COLUMN IF NOT EXISTS address VARCHAR DEFAULT ''"))
+                conn.execute(text("ALTER TABLE employees ADD COLUMN IF NOT EXISTS notes VARCHAR DEFAULT ''"))
+                conn.execute(text("ALTER TABLE employees ADD COLUMN IF NOT EXISTS is_active INTEGER DEFAULT 1"))
+                conn.execute(text("UPDATE employees SET email = '' WHERE email IS NULL"))
+                conn.execute(text("UPDATE employees SET address = '' WHERE address IS NULL"))
+                conn.execute(text("UPDATE employees SET notes = '' WHERE notes IS NULL"))
+                conn.execute(text("UPDATE employees SET is_active = 1 WHERE is_active IS NULL"))
                 conn.execute(text("CREATE INDEX IF NOT EXISTS ix_employees_role ON employees(role)"))
                 conn.execute(text("INSERT INTO employees (name, phone, role, pin) VALUES ('Orderer mặc định', '', 'orderer', '0000') ON CONFLICT (pin) DO NOTHING"))
                 conn.execute(text("INSERT INTO employees (name, phone, role, pin) VALUES ('Picker mặc định', '', 'picker', '1111') ON CONFLICT (pin) DO NOTHING"))
@@ -490,6 +524,39 @@ def _generate_unique_pin(db: Session):
             return pin
     raise HTTPException(status_code=500, detail="Không tạo được PIN duy nhất")
 
+
+def _normalize_employee_pin(raw_pin: str) -> str:
+    pin = (raw_pin or '').strip()
+    if not pin:
+        raise HTTPException(status_code=400, detail='PIN không được để trống')
+    if not pin.isdigit():
+        raise HTTPException(status_code=400, detail='PIN chỉ được chứa chữ số')
+    if len(pin) < 4 or len(pin) > 8:
+        raise HTTPException(status_code=400, detail='PIN phải có 4-8 chữ số')
+    return pin
+
+
+def _serialize_employee(e: Employee, delivered_count: int = 0):
+    last_delivered = None
+    if getattr(e, 'delivered_orders', None):
+        delivered_dates = [o.delivered_at for o in e.delivered_orders if getattr(o, 'delivered_at', None) is not None]
+        if delivered_dates:
+            last_delivered = max(delivered_dates)
+    return {
+        'id': e.id,
+        'name': e.name,
+        'phone': e.phone,
+        'email': (getattr(e, 'email', '') or ''),
+        'address': (getattr(e, 'address', '') or ''),
+        'notes': (getattr(e, 'notes', '') or ''),
+        'role': e.role,
+        'pin': e.pin,
+        'is_active': int(getattr(e, 'is_active', 1) or 0),
+        'created_at': e.created_at.strftime('%Y-%m-%d %H:%M') if e.created_at else '',
+        'delivered_count': int(delivered_count or 0),
+        'last_delivered_at': last_delivered.strftime('%Y-%m-%d %H:%M') if last_delivered else '',
+    }
+
 def _serialize_order(o: Order):
     items_list = []
     calc_qty = 0
@@ -599,12 +666,20 @@ class CustomerUpdate(BaseModel):
 class EmployeeCreate(BaseModel):
     name: str
     phone: str = ""
+    email: str = ""
+    address: str = ""
+    notes: str = ""
     role: str
 
 class EmployeeUpdate(BaseModel):
     name: str
     phone: str = ""
+    email: str = ""
+    address: str = ""
+    notes: str = ""
     role: str
+    pin: Optional[str] = None
+    is_active: int = 1
 
 class PinLoginRequest(BaseModel):
     pin: str
@@ -694,6 +769,8 @@ def pin_login(data: PinLoginRequest, db: Session = Depends(get_db)):
     emp = db.query(Employee).filter(Employee.pin == data.pin.strip()).first()
     if not emp:
         raise HTTPException(status_code=401, detail='PIN không đúng')
+    if int(getattr(emp, 'is_active', 1) or 0) != 1:
+        raise HTTPException(status_code=403, detail='Tài khoản nhân viên đang bị khóa')
     if emp.role != req_role:
         raise HTTPException(status_code=403, detail='PIN không thuộc vai trò này')
     return {
@@ -706,13 +783,13 @@ def pin_login(data: PinLoginRequest, db: Session = Depends(get_db)):
 @app.get('/employees')
 def get_employees(db: Session = Depends(get_db)):
     emps = db.query(Employee).order_by(desc(Employee.id)).all()
-    return [{
-        'id': e.id,
-        'name': e.name,
-        'phone': e.phone,
-        'role': e.role,
-        'pin': e.pin,
-    } for e in emps]
+    delivered_stats = dict(
+        db.query(Order.delivered_by_id, func.count(Order.id))
+        .filter(Order.delivered_by_id.isnot(None), Order.status == 'completed')
+        .group_by(Order.delivered_by_id)
+        .all()
+    )
+    return [_serialize_employee(e, delivered_count=delivered_stats.get(e.id, 0)) for e in emps]
 
 @app.post('/employees')
 def create_employee(data: EmployeeCreate, db: Session = Depends(get_db)):
@@ -720,11 +797,20 @@ def create_employee(data: EmployeeCreate, db: Session = Depends(get_db)):
     if role not in ('orderer', 'picker', 'manager'):
         raise HTTPException(status_code=400, detail='Vai trò không hợp lệ')
     pin = _generate_unique_pin(db)
-    emp = Employee(name=data.name.strip(), phone=data.phone.strip(), role=role, pin=pin)
+    emp = Employee(
+        name=data.name.strip(),
+        phone=data.phone.strip(),
+        email=data.email.strip(),
+        address=data.address.strip(),
+        notes=data.notes.strip(),
+        role=role,
+        pin=pin,
+        is_active=1,
+    )
     db.add(emp)
     db.commit()
     db.refresh(emp)
-    return {'status': 'created', 'id': emp.id, 'pin': emp.pin}
+    return {'status': 'created', 'id': emp.id, 'pin': emp.pin, 'employee': _serialize_employee(emp)}
 
 @app.put('/employees/{emp_id}')
 def update_employee(emp_id: int, data: EmployeeUpdate, db: Session = Depends(get_db)):
@@ -736,9 +822,20 @@ def update_employee(emp_id: int, data: EmployeeUpdate, db: Session = Depends(get
         raise HTTPException(status_code=400, detail='Vai trò không hợp lệ')
     emp.name = data.name.strip()
     emp.phone = data.phone.strip()
+    emp.email = data.email.strip()
+    emp.address = data.address.strip()
+    emp.notes = data.notes.strip()
     emp.role = role
+    emp.is_active = 1 if int(data.is_active or 0) == 1 else 0
+    if data.pin is not None:
+        normalized_pin = _normalize_employee_pin(data.pin)
+        existed = db.query(Employee).filter(Employee.pin == normalized_pin, Employee.id != emp_id).first()
+        if existed:
+            raise HTTPException(status_code=400, detail='PIN đã tồn tại, vui lòng chọn PIN khác')
+        emp.pin = normalized_pin
     db.commit()
-    return {'status': 'updated'}
+    db.refresh(emp)
+    return {'status': 'updated', 'employee': _serialize_employee(emp)}
 
 @app.delete('/employees/{emp_id}')
 def delete_employee(emp_id: int, db: Session = Depends(get_db)):
@@ -748,6 +845,37 @@ def delete_employee(emp_id: int, db: Session = Depends(get_db)):
     db.delete(emp)
     db.commit()
     return {'status': 'deleted'}
+
+
+@app.get('/employees/{emp_id}/deliveries')
+def get_employee_deliveries(emp_id: int, q: str = '', days: int = 0, limit: int = 200, db: Session = Depends(get_db)):
+    emp = db.query(Employee).filter(Employee.id == emp_id).first()
+    if not emp:
+        raise HTTPException(status_code=404, detail='Nhân viên không tồn tại')
+
+    lim = 200 if limit <= 0 else min(limit, 500)
+    query = db.query(Order).filter(
+        Order.delivered_by_id == emp_id,
+        Order.status == 'completed',
+    )
+
+    keyword = q.strip()
+    if keyword:
+        if keyword.isdigit():
+            query = query.filter((Order.id == int(keyword)) | (Order.customer_name.ilike(f"%{keyword}%")))
+        else:
+            query = query.filter(Order.customer_name.ilike(f"%{keyword}%"))
+
+    if days > 0:
+        min_dt = _now_vn() - timedelta(days=days)
+        query = query.filter(Order.delivered_at.isnot(None), Order.delivered_at >= min_dt)
+
+    orders = query.order_by(desc(Order.delivered_at), desc(Order.id)).limit(lim).all()
+    return {
+        'employee': _serialize_employee(emp),
+        'data': [_serialize_order(o) for o in orders],
+        'count': len(orders),
+    }
 
 # --- API SẢN PHẨM ---
 @app.get("/products")

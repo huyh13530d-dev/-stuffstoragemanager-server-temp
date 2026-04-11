@@ -136,8 +136,12 @@ class Employee(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, index=True)
     phone = Column(String, default="")
+    email = Column(String, default="")
+    address = Column(String, default="")
+    notes = Column(String, default="")
     role = Column(String, index=True)
     pin = Column(String, unique=True, index=True)
+    is_active = Column(Integer, default=1)
     created_at = Column(DateTime, default=_now_vn)
 
     assigned_orders = relationship("Order", foreign_keys=[Order.assigned_picker_id], back_populates="assigned_picker")
