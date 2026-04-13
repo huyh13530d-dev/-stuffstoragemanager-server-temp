@@ -1,0 +1,8 @@
+[build]
+builder = "nixpacks"
+
+[build.nixpacks]
+installCmd = "pip install -r requirements.txt"
+
+[deploy]
+startCommand = "bash -lc \"set -e; export DEBIAN_FRONTEND=noninteractive; apt-get update && apt-get install -y wget ca-certificates gnupg && wget -qO - https://www.postgresql.org/media/keys/ACCC4CF8.asc | gpg --dearmor --batch --yes -o /usr/share/keyrings/pgdg.gpg && echo 'deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt noble-pgdg main' > /etc/apt/sources.list.d/pgdg.list && apt-get update && apt-get install -y postgresql-client-18 && python backup_postgres_to_telegram.py --label railway\""
