@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional
@@ -82,6 +83,18 @@ class DeliveryProofAckRequest(BaseModel):
     local_file_names: List[str] = []
 
 app = FastAPI()
+
+_cors_raw = os.environ.get("CORS_ALLOWED_ORIGINS", "*").strip()
+_cors_origins = [x.strip() for x in _cors_raw.split(",") if x.strip()]
+_cors_allow_all = (not _cors_origins) or ("*" in _cors_origins)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if _cors_allow_all else _cors_origins,
+    allow_credentials=False if _cors_allow_all else True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 _delivery_upload_dir = os.environ.get("DELIVERY_UPLOAD_DIR", "").strip()
 if not _delivery_upload_dir:
